@@ -9,6 +9,7 @@ from .config import Config
 from .llm import Reviewer
 from .market import Market, is_crypto
 from .risk import daily_loss_hit, plan_order
+from .scanner import MoverScanner
 from .strategy import chart_summary, evaluate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -26,6 +27,7 @@ class Bot:
         self.crypto_exits: dict[str, tuple[str, float, float]] = {}  # symbol -> (side, stop, target)
         self.seen: set[tuple[str, str]] = set()  # (symbol, bar time) already handled
         self.halted = False
+        self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
 
     # ---------- journal ----------
@@ -51,7 +53,12 @@ class Bot:
         if self.halted:
             return
 
-        symbols = (self.cfg.stocks if market_open else []) + (self.cfg.cryptos if self.cfg.trade_crypto else [])
+        stocks = list(self.cfg.stocks)
+        movers = []
+        if market_open and self.scanner:
+            movers = [m for m in self.scanner.refresh() if m not in stocks]
+            stocks += movers
+        symbols = (stocks if market_open else []) + (self.cfg.cryptos if self.cfg.trade_crypto else [])
         if not symbols:
             return
         bars = self.mkt.bars(symbols)
@@ -68,7 +75,10 @@ class Bot:
                 continue
             self.seen.add(bar_key)
 
-            sig = evaluate(sym, df, allow_short=not is_crypto(sym))
+            if sym in movers and not enough_volume(df, self.cfg.min_iex_volume):
+                continue  # thin trading = wide spreads and fake breakouts
+            can_short = not is_crypto(sym) and (sym not in movers or sym in self.scanner.shortable)
+            sig = evaluate(sym, df, allow_short=can_short)
             if not sig or sig.score < self.cfg.min_score:
                 continue
             pos_key = sym.replace("/", "")
@@ -165,6 +175,11 @@ class Bot:
                 except Exception as e:
                     log.error("could not close %s: %s", pos_key, e)
         log.info("Bot stopped after %.0f min.", (time.time() - started) / 60)
+
+
+def enough_volume(df, min_shares) -> bool:
+    today = df.index[-1].date()
+    return df.loc[df.index.date == today, "volume"].sum() >= min_shares
 
 
 def main():

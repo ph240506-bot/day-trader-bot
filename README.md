@@ -9,6 +9,13 @@ with a stop-loss and profit target already attached.
 Everything here costs $0: Alpaca paper account, Alpaca market data (IEX feed), free
 LLM tiers through freellmapi, and GitHub Actions for hosting.
 
+## What it watches
+
+Your fixed list (`STOCK_SYMBOLS`, default 8 big names) **plus today's top 10 % movers**,
+refreshed every 15 minutes from Alpaca's free screener, plus BTC and ETH. Movers are
+filtered: no stocks under $5, no warrants/units, no untradable or barely-traded names,
+and the bot only shorts a mover if Alpaca says it's easy to borrow.
+
 ## How it decides (plain English)
 
 1. **Trend turn.** A fast moving average (last ~9 candles) crosses a slow one (~21 candles).

@@ -34,6 +34,17 @@ class Config:
     cryptos: list = field(default_factory=lambda: _list("CRYPTO_SYMBOLS", ["BTC/USD", "ETH/USD"]))
     trade_crypto: bool = field(default_factory=lambda: _env("TRADE_CRYPTO", True, bool))
 
+    # Top-mover scanner: adds today's biggest % movers on top of STOCK_SYMBOLS.
+    scan_movers: bool = field(default_factory=lambda: _env("SCAN_MOVERS", True, bool))
+    top_movers: int = field(default_factory=lambda: _env("TOP_MOVERS", 10, int))
+    scan_every_minutes: int = field(default_factory=lambda: _env("SCAN_EVERY_MINUTES", 15, int))
+    min_price: float = field(default_factory=lambda: _env("MIN_PRICE", 5.0, float))
+    max_price: float = field(default_factory=lambda: _env("MAX_PRICE", 1000.0, float))
+    min_move_pct: float = field(default_factory=lambda: _env("MIN_MOVE_PCT", 3.0, float))
+    # Skip a mover if fewer than this many shares traded on the IEX feed today.
+    # (IEX sees only a slice of total volume, so this number looks small on purpose.)
+    min_iex_volume: int = field(default_factory=lambda: _env("MIN_IEX_VOLUME", 20000, int))
+
     # Loop timing
     bar_minutes: int = field(default_factory=lambda: _env("BAR_MINUTES", 5, int))
     loop_seconds: int = field(default_factory=lambda: _env("LOOP_SECONDS", 60, int))

@@ -137,6 +137,7 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
     bars = pd.concat([bars, make_bars([105.2]).set_index(bars.index[-1:] + pd.Timedelta("5min"))])
 
     class FakeMarket:
+        trading = None
         def __init__(self, cfg): pass
         def account(self): return SimpleNamespace(equity="100000", last_equity="100000")
         def bars(self, syms): return {"AAPL": bars}
@@ -151,9 +152,34 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
 
     monkeypatch.setattr(m, "Market", FakeMarket)
     monkeypatch.setattr(m, "Reviewer", FakeReviewer)
+
+    class FakeScanner:
+        shortable = set()
+        def __init__(self, cfg, trading): pass
+        def refresh(self): return ["MOVR"]  # a mover with no bars must be harmless
+    monkeypatch.setattr(m, "MoverScanner", FakeScanner)
     b = m.Bot(cfg)
     b.tick(market_open=True)
     b.tick(market_open=True)  # same bar again must not double-order
     assert len(orders) == 1 and orders[0][1] == "buy"
     journal = (tmp_path / "trades.csv").read_text()
     assert "ordered" in journal and "AAPL" in journal
+
+
+def test_mover_filter_drops_junk():
+    from bot.scanner import pick_movers
+    M = lambda s, pct, price: SimpleNamespace(symbol=s, percent_change=pct, price=price)
+    raw = [M("PENNY", 80, 0.9), M("ABCDW", 60, 12), M("BIGUP", 25, 40), M("DUMP", -18, 22),
+           M("SMALL", 1.5, 50), M("HALTD", 30, 15), M("BIGUP", 25, 40)]
+    assets = {"BIGUP": SimpleNamespace(tradable=True, status="active"),
+              "DUMP": SimpleNamespace(tradable=True, status="active"),
+              "SMALL": SimpleNamespace(tradable=True, status="active"),
+              "HALTD": SimpleNamespace(tradable=False, status="active")}
+    picked = [m.symbol for m in pick_movers(raw, Config(), assets.get)]
+    assert picked == ["BIGUP", "DUMP"]  # biggest moves first, losers included
+
+
+def test_volume_gate():
+    from bot.main import enough_volume
+    df = make_bars([10.0] * 10, np.full(10, 1000.0))
+    assert enough_volume(df, 5000) and not enough_volume(df, 50000)
