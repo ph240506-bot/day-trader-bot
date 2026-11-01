@@ -65,6 +65,9 @@ jobs:
           JOURNAL_PATH: journal/trades.csv
           MAX_OPEN_POSITIONS: "20"
           MAX_POSITION_PCT: "5"
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Which alerts reach your phone: TRADE, VETO, NEAR_MISS, ALERT (comma-separated)
+          NOTIFY_ON: TRADE,VETO,NEAR_MISS,ALERT
         run: python -m bot.main
 
       - name: Show today's journal

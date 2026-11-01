@@ -158,10 +158,13 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
         def __init__(self, cfg, trading): pass
         def refresh(self): return ["MOVR"]  # a mover with no bars must be harmless
     monkeypatch.setattr(m, "MoverScanner", FakeScanner)
+    sent = []
     b = m.Bot(cfg)
+    b.notify.send = lambda kind, title, msg, *a: sent.append((kind, title))
     b.tick(market_open=True)
     b.tick(market_open=True)  # same bar again must not double-order
     assert len(orders) == 1 and orders[0][1] == "buy"
+    assert sent and sent[0][0] == "trade" and sent[0][1].startswith("BUY AAPL")
     journal = (tmp_path / "trades.csv").read_text()
     assert "ordered" in journal and "AAPL" in journal
 
@@ -183,3 +186,32 @@ def test_volume_gate():
     from bot.main import enough_volume
     df = make_bars([10.0] * 10, np.full(10, 1000.0))
     assert enough_volume(df, 5000) and not enough_volume(df, 50000)
+
+
+def test_notifier_posts_to_ntfy(monkeypatch):
+    from bot.notify import Notifier
+    got = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            got.append((self.path, self.headers["Title"], self.headers["Priority"],
+                        self.rfile.read(int(self.headers["Content-Length"])).decode()))
+            self.send_response(200); self.end_headers()
+        def log_message(self, *a): pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("NTFY_TOPIC", "pat-bot-abc123")
+    monkeypatch.setenv("NTFY_SERVER", f"http://127.0.0.1:{srv.server_port}")
+    monkeypatch.setenv("NOTIFY_ON", "TRADE,VETO")
+    n = Notifier(Config())
+    n.send("trade", "BUY NVDA x12", "Entry ~$185.00", 4, "chart_with_upwards_trend")
+    n.send("near_miss", "should be filtered", "x")
+    srv.shutdown()
+    assert got == [("/pat-bot-abc123", "BUY NVDA x12", "4", "Entry ~$185.00")]
+
+
+def test_notifier_never_raises(monkeypatch):
+    from bot.notify import Notifier
+    monkeypatch.setenv("NTFY_TOPIC", "t"); monkeypatch.setenv("NTFY_SERVER", "http://127.0.0.1:9")
+    Notifier(Config()).send("trade", "x", "y")  # server down: must not crash the bot

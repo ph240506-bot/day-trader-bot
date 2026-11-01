@@ -69,6 +69,12 @@ class Config:
     llm_required: bool = field(default_factory=lambda: _env("LLM_REQUIRED", True, bool))
 
     # Dry run: analyse and log, never send orders.
+    # Phone alerts (ntfy.sh). Leave NTFY_TOPIC empty to turn off.
+    ntfy_topic: str = field(default_factory=lambda: _env("NTFY_TOPIC", ""))
+    ntfy_server: str = field(default_factory=lambda: _env("NTFY_SERVER", "https://ntfy.sh"))
+    notify_on: list = field(default_factory=lambda: [s.lower() for s in _list(
+        "NOTIFY_ON", ["TRADE", "VETO", "NEAR_MISS", "ALERT"])])
+
     status_every_minutes: int = field(default_factory=lambda: _env("STATUS_EVERY_MINUTES", 5, int))
 
     dry_run: bool = field(default_factory=lambda: _env("DRY_RUN", False, bool))

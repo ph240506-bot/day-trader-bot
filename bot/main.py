@@ -9,6 +9,7 @@ from .config import Config
 from .llm import Reviewer
 from .market import Market, is_crypto
 from .risk import daily_loss_hit, plan_order
+from .notify import Notifier
 from .scanner import MoverScanner
 from .strategy import chart_summary, evaluate
 
@@ -24,6 +25,7 @@ class Bot:
         self.cfg = cfg
         self.mkt = Market(cfg)
         self.reviewer = Reviewer(cfg)
+        self.notify = Notifier(cfg)
         self.crypto_exits: dict[str, tuple[str, float, float]] = {}  # symbol -> (side, stop, target)
         self.seen: set[tuple[str, str]] = set()  # (symbol, bar time) already handled
         self.halted = False
@@ -50,6 +52,9 @@ class Bot:
                       equity, last_equity)
             if not self.cfg.dry_run:
                 self.mkt.flatten_all()
+            self.notify.send("alert", "Daily loss limit hit",
+                             f"Account down {(equity - last_equity) / last_equity * 100:.1f}% today "
+                             f"(${equity:,.0f}). Closed everything, no new trades today.", 5, "rotating_light")
             self.halted = True
         if self.halted:
             return
@@ -84,6 +89,8 @@ class Bot:
             if sig and sig.score < self.cfg.min_score:
                 log.info("Near miss: %s %s scored %d/5 (need %d): %s", sig.side, sym, sig.score,
                          self.cfg.min_score, "; ".join(sig.reasons))
+                self.notify.send("near_miss", f"Near miss: {sig.side} {sym} {sig.score}/5",
+                                 f"${sig.price:,.2f}. Had: " + "; ".join(sig.reasons), 2, "eyes")
             if not sig or sig.score < self.cfg.min_score:
                 continue
             pos_key = sym.replace("/", "")
@@ -103,6 +110,9 @@ class Bot:
 
             if verdict["decision"] != "approve" or not plan:
                 row["action"] = "skipped"
+                if verdict["decision"] != "approve":
+                    self.notify.send("veto", f"AI veto: {sig.side} {sym} ({sig.score}/5)",
+                                     f"${sig.price:,.2f}. {verdict['reason']}", 3, "no_entry")
             elif self.cfg.dry_run:
                 row["action"] = "dry-run"
             else:
@@ -113,9 +123,16 @@ class Bot:
                     if is_crypto(sym):
                         self.crypto_exits[pos_key] = (sig.side, plan.stop, plan.target)
                     log.info("ORDER %s %s x%s stop %.2f target %.2f", sig.side, sym, plan.qty, plan.stop, plan.target)
+                    self.notify.send(
+                        "trade", f"{'BUY' if sig.side == 'buy' else 'SHORT'} {sym} x{plan.qty}",
+                        f"Entry ~${sig.price:,.2f} (${plan.qty * sig.price:,.0f})\n"
+                        f"Stop ${plan.stop:,.2f} | Target ${plan.target:,.2f}\n"
+                        f"Score {sig.score}/5: " + "; ".join(sig.reasons) + f"\nAI: {verdict['reason']}",
+                        4, "chart_with_upwards_trend" if sig.side == "buy" else "chart_with_downwards_trend")
                 except Exception as e:
                     row["action"] = f"error: {e}"[:200]
                     log.error("order failed for %s: %s", sym, e)
+                    self.notify.send("alert", f"Order failed: {sym}", str(e)[:300], 4, "warning")
             self.journal(row)
 
     def status(self, symbols, bars, equity, last_equity, positions, market_open):
@@ -143,6 +160,9 @@ class Bot:
             hit = (price <= stop or price >= target) if side == "buy" else (price >= stop or price <= target)
             if hit:
                 log.info("Crypto exit %s at %.2f (stop %.2f / target %.2f)", sym, price, stop, target)
+                won = (price >= target) if side == "buy" else (price <= target)
+                self.notify.send("trade", f"Closed {sym}: {'target hit' if won else 'stopped out'}",
+                                 f"Exit ~${price:,.2f}", 4, "white_check_mark" if won else "x")
                 if not self.cfg.dry_run:
                     self.mkt.close(sym)
                 self.crypto_exits.pop(pos_key)
@@ -170,6 +190,11 @@ class Bot:
                 stocks_live = False
                 if flattened_for != clock.timestamp.date():
                     log.info("%.0f min to close: flattening for the day.", mins_to_close)
+                    acct = self.mkt.account()
+                    eq, prev = float(acct.equity), float(acct.last_equity)
+                    self.notify.send("alert", "Market closing: positions closed",
+                                     f"Account ${eq:,.2f}, today {eq - prev:+,.2f} ({(eq - prev) / prev * 100:+.2f}%)",
+                                     3, "bell")
                     if not self.cfg.dry_run:
                         self.mkt.flatten_all()
                     self.crypto_exits.clear()
