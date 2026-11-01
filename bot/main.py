@@ -1,0 +1,177 @@
+"""Main loop: every minute, pull fresh bars, look for setups, ask the LLM, size, trade, journal."""
+import csv
+import logging
+import os
+import time
+from datetime import datetime, timezone
+
+from .config import Config
+from .llm import Reviewer
+from .market import Market, is_crypto
+from .risk import daily_loss_hit, plan_order
+from .strategy import chart_summary, evaluate
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("bot")
+
+JOURNAL_FIELDS = ["time", "symbol", "side", "score", "price", "qty", "stop", "target",
+                  "llm_decision", "llm_reason", "action", "reasons"]
+
+
+class Bot:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.mkt = Market(cfg)
+        self.reviewer = Reviewer(cfg)
+        self.crypto_exits: dict[str, tuple[str, float, float]] = {}  # symbol -> (side, stop, target)
+        self.seen: set[tuple[str, str]] = set()  # (symbol, bar time) already handled
+        self.halted = False
+        os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
+
+    # ---------- journal ----------
+    def journal(self, row: dict):
+        new = not os.path.exists(self.cfg.journal_path)
+        with open(self.cfg.journal_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=JOURNAL_FIELDS)
+            if new:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in JOURNAL_FIELDS})
+
+    # ---------- one pass ----------
+    def tick(self, market_open: bool):
+        acct = self.mkt.account()
+        equity, last_equity = float(acct.equity), float(acct.last_equity)
+
+        if not self.halted and daily_loss_hit(equity, last_equity, self.cfg):
+            log.error("Daily loss limit hit (equity %.2f vs %.2f). Flattening and stopping new trades.",
+                      equity, last_equity)
+            if not self.cfg.dry_run:
+                self.mkt.flatten_all()
+            self.halted = True
+        if self.halted:
+            return
+
+        symbols = (self.cfg.stocks if market_open else []) + (self.cfg.cryptos if self.cfg.trade_crypto else [])
+        if not symbols:
+            return
+        bars = self.mkt.bars(symbols)
+        positions = self.mkt.positions()
+        self.manage_crypto_exits(bars, positions)
+
+        for sym, df in bars.items():
+            if len(df) < 2:
+                continue
+            # Only act on a finished bar: drop the still-forming last one.
+            df = df.iloc[:-1]
+            bar_key = (sym, str(df.index[-1]))
+            if bar_key in self.seen:
+                continue
+            self.seen.add(bar_key)
+
+            sig = evaluate(sym, df, allow_short=not is_crypto(sym))
+            if not sig or sig.score < self.cfg.min_score:
+                continue
+            pos_key = sym.replace("/", "")
+            if pos_key in positions or len(positions) >= self.cfg.max_open_positions:
+                continue
+            if not self.cfg.dry_run and self.mkt.has_open_order(sym):
+                continue
+
+            verdict = self.reviewer.review(sig, chart_summary(df), self.mkt.headlines(sym))
+            plan = plan_order(sig.side, sig.price, sig.atr, equity, self.cfg, fractional=is_crypto(sym))
+            row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
+                   "side": sig.side, "score": sig.score, "price": sig.price,
+                   "llm_decision": verdict["decision"], "llm_reason": verdict["reason"],
+                   "reasons": "; ".join(sig.reasons)}
+            if plan:
+                row.update(qty=plan.qty, stop=plan.stop, target=plan.target)
+
+            if verdict["decision"] != "approve" or not plan:
+                row["action"] = "skipped"
+            elif self.cfg.dry_run:
+                row["action"] = "dry-run"
+            else:
+                try:
+                    self.mkt.enter(sym, sig.side, plan)
+                    row["action"] = "ordered"
+                    positions[pos_key] = True  # count it toward the cap this pass
+                    if is_crypto(sym):
+                        self.crypto_exits[pos_key] = (sig.side, plan.stop, plan.target)
+                    log.info("ORDER %s %s x%s stop %.2f target %.2f", sig.side, sym, plan.qty, plan.stop, plan.target)
+                except Exception as e:
+                    row["action"] = f"error: {e}"[:200]
+                    log.error("order failed for %s: %s", sym, e)
+            self.journal(row)
+
+    def manage_crypto_exits(self, bars, positions):
+        for pos_key, (side, stop, target) in list(self.crypto_exits.items()):
+            if pos_key not in positions:
+                self.crypto_exits.pop(pos_key)
+                continue
+            sym = next((s for s in bars if s.replace("/", "") == pos_key), None)
+            if not sym:
+                continue
+            price = float(bars[sym]["close"].iloc[-1])
+            hit = (price <= stop or price >= target) if side == "buy" else (price >= stop or price <= target)
+            if hit:
+                log.info("Crypto exit %s at %.2f (stop %.2f / target %.2f)", sym, price, stop, target)
+                if not self.cfg.dry_run:
+                    self.mkt.close(sym)
+                self.crypto_exits.pop(pos_key)
+
+    # ---------- session ----------
+    def run(self):
+        started = time.time()
+        deadline = started + self.cfg.max_runtime_minutes * 60
+        log.info("Bot starting. paper=%s dry_run=%s llm=%s", self.cfg.paper, self.cfg.dry_run,
+                 "on" if self.reviewer.client else "off")
+
+        clock = self.mkt.clock()
+        if not clock.is_open:
+            wait = (clock.next_open - clock.timestamp).total_seconds()
+            if wait > self.cfg.wait_for_open_minutes * 60 and not self.cfg.trade_crypto:
+                log.info("Market opens in %.0f min; nothing to do. Exiting.", wait / 60)
+                return
+
+        flattened_for = None  # date we already flattened on
+        while time.time() < deadline:
+            clock = self.mkt.clock()
+            mins_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
+            stocks_live = clock.is_open
+            if clock.is_open and mins_to_close <= self.cfg.flatten_minutes_before_close:
+                stocks_live = False
+                if flattened_for != clock.timestamp.date():
+                    log.info("%.0f min to close: flattening for the day.", mins_to_close)
+                    if not self.cfg.dry_run:
+                        self.mkt.flatten_all()
+                    self.crypto_exits.clear()
+                    flattened_for = clock.timestamp.date()
+            if not clock.is_open and not self.cfg.trade_crypto:
+                wait = (clock.next_open - clock.timestamp).total_seconds()
+                if wait > self.cfg.wait_for_open_minutes * 60:
+                    log.info("Market closed. Exiting.")
+                    break
+            try:
+                self.tick(market_open=stocks_live)
+            except Exception as e:
+                log.exception("tick failed: %s", e)
+            time.sleep(self.cfg.loop_seconds)
+
+        # Crypto is only watched while the bot runs, so never leave it unattended.
+        if self.crypto_exits and not self.cfg.dry_run:
+            for pos_key in list(self.crypto_exits):
+                try:
+                    self.mkt.close(pos_key)
+                except Exception as e:
+                    log.error("could not close %s: %s", pos_key, e)
+        log.info("Bot stopped after %.0f min.", (time.time() - started) / 60)
+
+
+def main():
+    cfg = Config()
+    cfg.validate()
+    Bot(cfg).run()
+
+
+if __name__ == "__main__":
+    main()

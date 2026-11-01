@@ -1,0 +1,4 @@
+alpaca-py>=0.44
+pandas>=2.2
+numpy>=1.26
+openai>=1.50

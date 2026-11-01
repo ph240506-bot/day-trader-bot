@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "alpaca": {
+      "command": "uvx",
+      "args": ["alpaca-mcp-server"],
+      "env": {
+        "ALPACA_API_KEY": "your_paper_key",
+        "ALPACA_SECRET_KEY": "your_paper_secret",
+        "ALPACA_TOOLSETS": "account,stock-data,crypto-data,news"
+      }
+    },
+    "yahoo-finance": {
+      "command": "uvx",
+      "args": ["mcp-yahoo-finance"]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+# Always-on option: an Oracle Cloud "Always Free" VM (or a Raspberry Pi / old laptop).
+# 1. cp .env.example .env  and fill it in
+# 2. docker compose up -d freellmapi
+# 3. open http://<vm>:3001 via an SSH tunnel, add free provider keys, copy the unified key into .env as LLM_API_KEY
+#    (or set GROQ_API_KEY etc. in .env and run scripts/build_freellmapi_config.py, see README)
+# 4. docker compose up -d bot
+# The bot loops forever: it sleeps while the market is shut and restarts itself daily.
+services:
+  freellmapi:
+    image: ghcr.io/tashfeenahmed/freellmapi:latest
+    restart: unless-stopped
+    environment:
+      ENCRYPTION_KEY: ${FREELLMAPI_ENCRYPTION_KEY}
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - freellmapi-data:/app/server/data
+
+  bot:
+    build: .
+    restart: always
+    depends_on: [freellmapi]
+    env_file: .env
+    environment:
+      LLM_BASE_URL: http://freellmapi:3001/v1
+      MAX_RUNTIME_MINUTES: "1440"   # one day, then Docker restarts it fresh
+      WAIT_FOR_OPEN_MINUTES: "1440"
+    volumes:
+      - ./journal:/app/journal
+
+volumes:
+  freellmapi-data:

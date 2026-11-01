@@ -1,0 +1,85 @@
+name: day-trader
+
+# US market hours are 9:30am-4pm New York time. The crons below are in UTC and cover both
+# daylight-saving and standard time; the bot itself checks Alpaca's market clock and exits
+# when there's nothing to do. A job can run at most 6 hours, so later runs pick up the rest
+# of the session (the concurrency group makes them wait their turn instead of overlapping).
+on:
+  schedule:
+    - cron: "20 13 * * 1-5"
+    - cron: "20 14 * * 1-5"
+    - cron: "5 19 * * 1-5"
+    - cron: "5 20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Analyse only, don't place orders"
+        type: boolean
+        default: true
+
+concurrency:
+  group: day-trader
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Start freellmapi (free LLM router) in the background
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          # Fresh throwaway instance every run: random encryption key and admin password.
+          ADMIN_PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$ADMIN_PW"
+          CONFIG="$(python scripts/build_freellmapi_config.py bot@localhost.test "$ADMIN_PW")"
+          docker run -d --name freellmapi -p 127.0.0.1:3001:3001 \
+            -e ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+            -e FREEAPI_CONFIG_JSON="$CONFIG" \
+            ghcr.io/tashfeenahmed/freellmapi:latest
+          KEY="$(python scripts/freellmapi_key.py http://localhost:3001 bot@localhost.test "$ADMIN_PW")"
+          echo "::add-mask::$KEY"
+          echo "LLM_API_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Run the bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: "true"
+          LLM_BASE_URL: http://localhost:3001/v1
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          JOURNAL_PATH: journal/trades.csv
+        run: python -m bot.main
+
+      - name: Show today's journal
+        if: always()
+        run: |
+          if [ -f journal/trades.csv ]; then
+            { echo '### Trade journal'; echo '```'; cat journal/trades.csv; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: journal-${{ github.run_id }}
+          path: journal/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: freellmapi logs (for debugging)
+        if: failure()
+        run: docker logs freellmapi --tail 100
