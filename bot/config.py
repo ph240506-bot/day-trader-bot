@@ -69,6 +69,8 @@ class Config:
     llm_required: bool = field(default_factory=lambda: _env("LLM_REQUIRED", True, bool))
 
     # Dry run: analyse and log, never send orders.
+    status_every_minutes: int = field(default_factory=lambda: _env("STATUS_EVERY_MINUTES", 5, int))
+
     dry_run: bool = field(default_factory=lambda: _env("DRY_RUN", False, bool))
     journal_path: str = field(default_factory=lambda: _env("JOURNAL_PATH", "journal/trades.csv"))
 

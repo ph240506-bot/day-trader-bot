@@ -27,6 +27,7 @@ class Bot:
         self.crypto_exits: dict[str, tuple[str, float, float]] = {}  # symbol -> (side, stop, target)
         self.seen: set[tuple[str, str]] = set()  # (symbol, bar time) already handled
         self.halted = False
+        self._last_status = 0.0
         self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
 
@@ -64,6 +65,7 @@ class Bot:
         bars = self.mkt.bars(symbols)
         positions = self.mkt.positions()
         self.manage_crypto_exits(bars, positions)
+        self.status(symbols, bars, equity, last_equity, positions, market_open)
 
         for sym, df in bars.items():
             if len(df) < 2:
@@ -79,6 +81,9 @@ class Bot:
                 continue  # thin trading = wide spreads and fake breakouts
             can_short = not is_crypto(sym) and (sym not in movers or sym in self.scanner.shortable)
             sig = evaluate(sym, df, allow_short=can_short)
+            if sig and sig.score < self.cfg.min_score:
+                log.info("Near miss: %s %s scored %d/5 (need %d): %s", sig.side, sym, sig.score,
+                         self.cfg.min_score, "; ".join(sig.reasons))
             if not sig or sig.score < self.cfg.min_score:
                 continue
             pos_key = sym.replace("/", "")
@@ -112,6 +117,19 @@ class Bot:
                     row["action"] = f"error: {e}"[:200]
                     log.error("order failed for %s: %s", sym, e)
             self.journal(row)
+
+    def status(self, symbols, bars, equity, last_equity, positions, market_open):
+        """Heartbeat so a quiet log still shows the bot is alive and looking."""
+        if time.time() - self._last_status < self.cfg.status_every_minutes * 60:
+            return
+        self._last_status = time.time()
+        day_pl = equity - last_equity
+        prices = ", ".join(f"{s} {float(bars[s]['close'].iloc[-1]):,.2f}" for s in list(bars)[:6])
+        log.info("Status: %s | watching %d symbols (%s%s) | equity $%s (today %+.2f) | %d open position(s)%s",
+                 "stocks+crypto" if market_open else "crypto only (stock market closed)",
+                 len(symbols), prices, ", ..." if len(bars) > 6 else "",
+                 f"{equity:,.2f}", day_pl, len(positions),
+                 ": " + ", ".join(positions) if positions else "")
 
     def manage_crypto_exits(self, bars, positions):
         for pos_key, (side, stop, target) in list(self.crypto_exits.items()):
