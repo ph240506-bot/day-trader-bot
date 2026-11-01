@@ -6,10 +6,7 @@ name: day-trader
 # of the session (the concurrency group makes them wait their turn instead of overlapping).
 on:
   schedule:
-    - cron: "20 13 * * 1-5"
-    - cron: "20 14 * * 1-5"
-    - cron: "5 19 * * 1-5"
-    - cron: "5 20 * * 1-5"
+    - cron: "0 */3 * * *"   # every 3h, every day: a new run is always queued, so it runs back to back 24/7
   workflow_dispatch:
     inputs:
       dry_run:
