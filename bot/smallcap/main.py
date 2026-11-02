@@ -13,7 +13,7 @@ from .brain import Brain
 from .broker import AlpacaBroker
 from .config import SCConfig
 from .engine import Engine, session
-from .feeds import HaltWatch, edgar_poller, news_stream
+from .feeds import HaltWatch, edgar_poller, movers_scanner, news_stream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("smallcap")
@@ -52,6 +52,7 @@ async def exit_loop(engine, cfg, stop):
         try:
             await engine.tick()               # exits + pullback watchlist, one batched price request
             await engine.check_daily_loss()
+            await engine.maybe_daily_summary()
         except Exception as e:
             log.exception("exit loop: %s", e)
         await asyncio.sleep(cfg.exit_poll_sec)
@@ -64,9 +65,10 @@ async def heartbeat(engine, broker, stats, stop):
             is_open, *_ = await asyncio.to_thread(broker.clock)
             equity, last = await asyncio.to_thread(broker.account)
             seen = sum(stats.values())
-            log.info("Status: %s | events %d (filtered %d, passed %d, watching %d, bought %d, traps %d) | "
-                     "equity $%s (today %+.2f) | watchlist: %s | positions: %s",
-                     session(datetime.now(NY), is_open), seen, stats.get("filtered", 0), stats.get("pass", 0),
+            ignored = sum(v for k, v in stats.items() if k.startswith("skip") or k in ("dupe", "stale"))
+            log.info("Status: %s | events %d (ignored %d: big caps/OTC/repeats, filtered %d, passed %d, watching %d, "
+                     "bought %d, traps %d) | equity $%s (today %+.2f) | watchlist: %s | positions: %s",
+                     session(datetime.now(NY), is_open), seen, ignored, stats.get("filtered", 0), stats.get("pass", 0),
                      stats.get("watching", 0), stats.get("bought", 0), stats.get("trap", 0), f"{equity:,.2f}",
                      equity - last,
                      ", ".join(f"{w.symbol} ({w.state}, high {w.high:.2f})" for w in engine.watching.values()) or "none",
@@ -95,12 +97,14 @@ async def run():
             pass
 
     stats: dict[str, int] = {}
-    log.info("Small-cap mode starting. paper=%s dry_run=%s entry=%s AI=%s models=%s finnhub=%s sec=%s",
+    log.info("Small-cap mode starting. paper=%s dry_run=%s entry=%s AI=%s models=%s finnhub=%s sec=%s scanner=%s",
              cfg.paper, cfg.dry_run, cfg.entry_mode, "on" if brain.client else "off", ",".join(cfg.llm_models),
-             "on" if cfg.finnhub_key else "off", "on" if cfg.edgar_user_agent else "off")
+             "on" if cfg.finnhub_key else "off", "on" if cfg.edgar_user_agent else "off",
+             f"every {cfg.scan_sec:.0f}s" if cfg.scan_movers else "off")
     tasks = [asyncio.create_task(c) for c in (
         news_stream(queue, cfg, stop), edgar_poller(queue, cfg, stop), halts.run(cfg, stop),
         exit_loop(engine, cfg, stop), heartbeat(engine, broker, stats, stop),
+        *([movers_scanner(queue, cfg, stop)] if cfg.scan_movers else []),
         *[worker(queue, engine, stats) for _ in range(4)])]
     await stop.wait()
     log.info("Stopping; open positions stay managed on restart (saved to disk).")

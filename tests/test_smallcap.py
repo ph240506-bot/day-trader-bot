@@ -31,6 +31,7 @@ class FakeBroker:
         self.per_symbol = {}
         self.shares = shares
         self.vwap_val = vwap
+        self.day_high = None
         self.orders, self.placed = {}, []
         self.fill_mode = "full"     # full | none | partial
         self.equity = (1000.0, 1000.0)
@@ -42,6 +43,7 @@ class FakeBroker:
     def account(self): return self.equity
     def shares_outstanding(self, s): return self.shares
     def vwap(self, s): return self.vwap_val
+    def intraday(self, s): return self.vwap_val, self.day_high
 
     def limit(self, sym, qty, side, price, extended):
         oid = f"o{len(self.placed)}"
@@ -100,7 +102,7 @@ STRONG = {"verdict": "strong", "confidence": 0.85, "reason": "FDA approval is ma
 
 @pytest.fixture(autouse=True)
 def regular_session(monkeypatch):
-    monkeypatch.setattr(eng, "session", lambda now, is_open: "regular")
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
 
 
 # ======================= instant triage =======================
@@ -161,7 +163,7 @@ def test_share_count_filter(tmp_path):
     # unknown share count: allowed by default, blocked if required
     assert run(Engine(cfg(tmp_path), FakeBroker(mover(), shares=None), FakeBrain(STRONG), Sink()).handle(ev("UNKN"))) == "bought"
     assert run(Engine(cfg(tmp_path, require_share_data=True), FakeBroker(mover(), shares=None),
-                      FakeBrain(STRONG), Sink()).handle(ev("UNK2"))) == "filtered"
+                      FakeBrain(STRONG), Sink()).handle(ev("UNKB"))) == "filtered"
 
 
 def test_ai_silence_or_weak_means_no_trade(tmp_path):
@@ -193,11 +195,11 @@ def test_limits_respected(tmp_path):
 
 
 def test_premarket_uses_extended_hours(tmp_path, monkeypatch):
-    monkeypatch.setattr(eng, "session", lambda now, is_open: "premarket")
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
     b = FakeBroker(mover())
     assert run(Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink()).handle(ev())) == "bought"
     assert b.placed[0][4] is True
-    monkeypatch.setattr(eng, "session", lambda now, is_open: "closed")
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "closed")
     assert run(Engine(cfg(tmp_path), FakeBroker(mover()), FakeBrain(STRONG), Sink()).handle(ev("ZZZZ"))) == "skip-session"
 
 
@@ -215,7 +217,7 @@ def test_parallel_events_respect_position_limit(tmp_path):
         q, stats = asyncio.Queue(), {}
         ws = [asyncio.create_task(worker(q, e, stats)) for _ in range(4)]
         for i in range(4):
-            await q.put(ev(f"RUN{i}", f"RUN{i} receives FDA approval"))
+            await q.put(ev("RUN" + "ABCD"[i], "RUN" + "ABCD"[i] + " receives FDA approval"))
         await q.join()
         for w in ws:
             w.cancel()
@@ -684,5 +686,180 @@ def test_clock_is_cached(tmp_path):
             return super().clock()
     e = Engine(cfg(tmp_path), CountingBroker(mover(price=180, prev=150)), FakeBrain(STRONG), Sink())
     for i in range(5):
-        run(e.handle(ev(f"BIG{i}", f"BIG{i} receives FDA approval")))
+        run(e.handle(ev("BIG" + "ABCDE"[i], "BIG" + "ABCDE"[i] + " receives FDA approval")))
     assert CountingBroker.calls == 1
+
+
+# ======================= gainers scanner =======================
+class FakeScreenerAPI(BaseHTTPRequestHandler):
+    """Alpaca screener + news endpoints in their real JSON format."""
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+
+    def log_message(self, *a): pass
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        now = datetime.now(timezone.utc)
+        if u.path.endswith("/screener/stocks/movers"):
+            return self._send({"gainers": [
+                {"symbol": "RUNR", "percent_change": 42.0, "change": 1.2, "price": 4.05},   # small cap jumping
+                {"symbol": "QUIET", "percent_change": 25.0, "change": 0.5, "price": 2.50},
+                {"symbol": "BIGCO", "percent_change": 12.0, "change": 20.0, "price": 190.0}, # not a small cap
+                {"symbol": "SLOW", "percent_change": 3.0, "change": 0.1, "price": 5.00},     # not moving enough
+                {"symbol": "ABCDW", "percent_change": 80.0, "change": 0.2, "price": 1.20},   # warrant
+            ], "losers": [], "market_type": "stocks", "last_updated": iso(now)})
+        if u.path.endswith("/news"):
+            items = []
+            if q.get("symbols") == "RUNR":
+                items = [{"id": 1, "headline": "RUNR receives FDA approval for lead drug", "author": "x",
+                          "created_at": iso(now - timedelta(minutes=95)), "updated_at": iso(now),
+                          "summary": "Approval covers adults.", "content": "", "url": "https://x", "images": [],
+                          "symbols": ["RUNR"], "source": "benzinga"}]
+            return self._send({"news": items, "next_page_token": None})
+        self.send_response(404); self.end_headers()
+
+
+def test_movers_scanner_with_real_clients(tmp_path):
+    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.historical.screener import ScreenerClient
+    from bot.smallcap.feeds import movers_scanner
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeScreenerAPI)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}"
+    c = cfg(tmp_path, scan_sec=0.05)
+
+    async def go():
+        q, stop = asyncio.Queue(), asyncio.Event()
+        task = asyncio.create_task(movers_scanner(q, c, stop, ScreenerClient("k", "s", url_override=url),
+                                                  NewsClient("k", "s", url_override=url)))
+        await asyncio.sleep(0.6)                 # several scan cycles
+        stop.set(); task.cancel()
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+    evs = run(go())
+    srv.shutdown()
+    assert [e.symbol for e in evs] == ["RUNR", "QUIET"]          # once each, filters applied
+    runr, nonews = evs
+    assert runr.source == "scanner" and "FDA approval" in runr.text and "95 min ago" in runr.text
+    assert "no news found" in nonews.text
+    # scanner events are fresh even though the headline is old, and flow through the normal pipeline
+    e = Engine(cfg(tmp_path), FakeBroker(mover()), FakeBrain(STRONG), Sink())
+    assert run(e.handle(runr)) == "bought"
+    weak = {"verdict": "weak", "confidence": 0.8, "reason": "no catalyst", "model": "x"}
+    e2 = Engine(cfg(tmp_path), FakeBroker(mover(price=2.5, prev=2.0)), FakeBrain(weak), Sink())
+    assert run(e2.handle(nonews)) == "pass"
+
+
+def test_warrants_units_rights_rejected(tmp_path):
+    from bot.smallcap.catalysts import is_common_stock_symbol
+    assert is_common_stock_symbol("RUNR") and is_common_stock_symbol("AAPL") and is_common_stock_symbol("GOOGL")
+    assert not any(is_common_stock_symbol(s) for s in ["ABCDW", "ABCDU", "ABCDR", "BRK.B", "AB1", ""])
+    e = Engine(cfg(tmp_path), FakeBroker(mover()), FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev("ABCDW", "ABCDW receives FDA approval"))) == "skip-asset"
+
+
+
+# ======================= v8: early close, day-high pullbacks, daily summary =======================
+def test_early_close_day_uses_alpacas_clock():
+    d = datetime(2026, 11, 27, 12, 55, tzinfo=NY)          # day after Thanksgiving: market shuts at 1pm
+    assert session(d, True, mins_to_close=5) == "closing"
+    assert session(d, True, mins_to_close=120) == "regular"
+    assert session(d.replace(hour=15, minute=55), True) == "closing"   # no clock info: old rule still works
+
+
+def test_engine_session_reads_next_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", session)            # the real one (autouse fixture faked it)
+    class EarlyClose(FakeBroker):
+        def clock(self):
+            return True, None, datetime.now(timezone.utc) + timedelta(minutes=4), None
+    e = Engine(cfg(tmp_path), EarlyClose(mover()), FakeBrain(STRONG), Sink())
+    assert run(e._session()) == "closing"
+
+
+def test_watch_starts_from_todays_high(tmp_path):
+    b = FakeBroker(mover(price=4.40), vwap=4.0)
+    b.day_high = 4.70                                        # spiked earlier, now 6% off the high
+    e = Engine(cfg(tmp_path, entry_mode="pullback"), b, FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "watching"
+    w = e.watching["ABCD"]
+    assert w.high == 4.70 and w.state == "pulling" and w.low == 4.40
+    tick_prices(e, b, [4.48])                               # +1.8% bounce above VWAP -> buy right away
+    assert "ABCD" in e.positions
+
+
+def test_already_faded_stock_not_watched(tmp_path):
+    b = FakeBroker(mover(price=4.0))
+    b.day_high = 5.50                                        # -27% from the high: the move is over
+    e = Engine(cfg(tmp_path, entry_mode="pullback"), b, FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "faded" and not e.watching
+
+
+def test_daily_summary_once_after_close(tmp_path, monkeypatch):
+    class Closed(FakeBroker):
+        def clock(self): return False, None, None, None
+    sink = Sink()
+    e = Engine(cfg(tmp_path), Closed(mover()), FakeBrain(STRONG), sink)
+    e.day_stats = {"trades": 3, "wins": 2, "pnl": 12.5, "watched": 5}
+    fake_now = datetime(2026, 11, 3, 16, 5, tzinfo=NY)       # Tuesday 4:05pm New York
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None): return fake_now if tz else fake_now.replace(tzinfo=None)
+    monkeypatch.setattr(eng, "datetime", FakeDT)
+    monkeypatch.setattr(eng, "session", session)            # real session(): clock says closed
+    run(e.maybe_daily_summary()); run(e.maybe_daily_summary())
+    summaries = [t for _, t in sink.sent if t.startswith("Small-cap day")]
+    assert summaries == ["Small-cap day: 2/3 wins, +$12.50"]
+
+
+def test_exit_updates_day_stats(tmp_path):
+    e, b, sink, p = _bought(tmp_path)
+    b.q = mover(price=p.target + 0.1)
+    run(e.tick())
+    assert e.day_stats["trades"] == 1 and e.day_stats["wins"] == 1 and e.day_stats["pnl"] > 0
+
+
+# ======================= performance report =======================
+def test_report_round_trips_long_short_partial():
+    from bot.report import round_trips, summarize
+    t = lambda m: f"2026-11-03T14:{m:02d}:00Z"
+    fills = [
+        {"symbol": "AAPL", "side": "buy", "qty": "10", "price": "100", "transaction_time": t(1)},
+        {"symbol": "AAPL", "side": "sell", "qty": "4", "price": "103", "transaction_time": t(2)},   # partial exit
+        {"symbol": "AAPL", "side": "sell", "qty": "6", "price": "99", "transaction_time": t(3)},
+        {"symbol": "TSLA", "side": "sell_short", "qty": "5", "price": "200", "transaction_time": t(4)},
+        {"symbol": "TSLA", "side": "buy", "qty": "5", "price": "190", "transaction_time": t(5)},
+        {"symbol": "BTC/USD", "side": "buy", "qty": "0.01", "price": "70000", "transaction_time": t(6)},  # still open
+    ]
+    trades = round_trips(fills)
+    assert [(x["symbol"], x["side"], x["pnl"]) for x in trades] == [("AAPL", "long", 6.0), ("TSLA", "short", 50.0)]
+    text = "\n".join(summarize(trades))
+    assert "Trades: 2" in text and "Win rate: 100%" in text and "+$56.00" in text
+
+
+def test_report_journal_sections(tmp_path):
+    from bot.report import journal_lines
+    main = tmp_path / "trades.csv"
+    main.write_text("time,symbol,side,score,price,qty,stop,target,llm_decision,llm_reason,action,reasons\n"
+                    "2026-11-03T15:00:00+00:00,NVDA,buy,4,180,5,177,186,approve,ok,ordered,x\n"
+                    "2026-11-03T15:05:00+00:00,AMD,buy,3,150,5,147,156,veto,earnings tomorrow,skipped,x\n")
+    out = "\n".join(journal_lines(str(main), "2026-11-03", "main"))
+    assert "ordered 1" in out and "4/5: 1" in out and "earnings tomorrow" in out
+    e = Engine(cfg(tmp_path), FakeBroker(mover(price=3.1, prev=3.0)), FakeBrain(STRONG), Sink())
+    run(e.handle(ev()))
+    out = "\n".join(journal_lines(str(tmp_path / "smallcap.csv"), "2000", "smallcap"))
+    assert "filtered 1" in out and "only +3.3%" in out
+
+
+def test_report_account_block_handles_alpaca_down(tmp_path, monkeypatch):
+    import bot.report as r
+    def boom(*a):
+        raise ConnectionError("no network")
+    monkeypatch.setattr(r, "fetch_fills", boom)
+    out = "\n".join(r.account_block("Main bot", "k", "s", True, 1, str(tmp_path / "none.csv"), "main"))
+    assert "Couldn't reach Alpaca" in out and "no journal entries" in out

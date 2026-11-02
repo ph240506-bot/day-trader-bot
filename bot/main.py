@@ -13,6 +13,7 @@ from .market import Market, is_crypto
 from .risk import daily_loss_hit, plan_order
 from .notify import Notifier
 from .scanner import MoverScanner
+from .indicators import add_all
 from .strategy import chart_summary, evaluate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -34,6 +35,8 @@ class Bot:
         self.halted = False
         self.halted_on = None  # New York date the loss limit fired; resets next trading day
         self._last_status = 0.0
+        self.mins_to_close = 9999.0     # set by run() from Alpaca's clock (handles early-close days)
+        self.seen_day = None
         self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         # Crypto stops/targets live here so a restart doesn't leave a position unmanaged.
@@ -49,8 +52,10 @@ class Bot:
 
     def _save_exits(self):
         try:
-            with open(self.state_path, "w") as f:
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self.crypto_exits, f)
+            os.replace(tmp, self.state_path)       # atomic: a power cut can't corrupt it
         except OSError as e:
             log.warning("could not save crypto exits: %s", e)
 
@@ -69,6 +74,8 @@ class Bot:
         equity, last_equity = float(acct.equity), float(acct.last_equity)
 
         today = datetime.now(NY).date()
+        if self.seen_day != today:          # long-running on the Pi: don't let this grow forever
+            self.seen_day, self.seen = today, set()
         if self.halted and self.halted_on != today:
             log.info("New trading day: daily loss limit reset.")
             self.halted = False
@@ -97,6 +104,8 @@ class Bot:
         positions = self.mkt.positions()
         self.manage_crypto_exits(bars, positions)
         self.status(symbols, bars, equity, last_equity, positions, market_open)
+        stock_entries_ok = market_open and self._in_entry_window()
+        regime = self._market_regime(bars) if (market_open and self.cfg.market_filter) else None
 
         for sym, df in bars.items():
             if len(df) < 2:
@@ -119,6 +128,15 @@ class Bot:
                                  f"${sig.price:,.2f}. Had: " + "; ".join(sig.reasons), 2, "eyes")
             if not sig or sig.score < self.cfg.min_score:
                 continue
+            if not is_crypto(sym):
+                if not stock_entries_ok:
+                    log.info("Skip %s %s: outside entry window (first %dm / last %dm of the session)",
+                             sig.side, sym, self.cfg.open_delay_min, self.cfg.no_entry_before_close_min)
+                    continue
+                if regime and ((sig.side == "buy" and regime == "down") or (sig.side == "sell" and regime == "up")):
+                    log.info("Skip %s %s: against the market (SPY %s its VWAP)", sig.side, sym,
+                             "below" if regime == "down" else "above")
+                    continue
             pos_key = sym.replace("/", "")
             if pos_key in positions or len(positions) >= self.cfg.max_open_positions:
                 continue
@@ -126,7 +144,13 @@ class Bot:
                 continue
 
             verdict = self.reviewer.review(sig, chart_summary(df), self.mkt.headlines(sym))
-            plan = plan_order(sig.side, sig.price, sig.atr, equity, self.cfg, fractional=is_crypto(sym))
+            # Re-price from the latest trade: the signal candle can be minutes old, and stops/targets
+            # must be on the correct side of the price the order actually fills at.
+            px = self.mkt.latest_price(sym) or sig.price
+            if abs(px - sig.price) > self.cfg.max_chase_atr * sig.atr:
+                log.info("Skip %s %s: price moved %.2f -> %.2f since the signal", sig.side, sym, sig.price, px)
+                continue
+            plan = plan_order(sig.side, px, sig.atr, equity, self.cfg, fractional=is_crypto(sym))
             row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
                    "side": sig.side, "score": sig.score, "price": sig.price,
                    "llm_decision": verdict["decision"], "llm_reason": verdict["reason"],
@@ -161,6 +185,21 @@ class Bot:
                     log.error("order failed for %s: %s", sym, e)
                     self.notify.send("alert", f"Order failed: {sym}", str(e)[:300], 4, "warning")
             self.journal(row)
+
+    def _in_entry_window(self) -> bool:
+        now = datetime.now(NY)
+        mins_since_open = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        return mins_since_open >= self.cfg.open_delay_min and self.mins_to_close >= self.cfg.no_entry_before_close_min
+
+    def _market_regime(self, bars):
+        """'up' if SPY is above today's VWAP, 'down' if below, None if unknown."""
+        spy = bars.get("SPY")
+        if spy is None:
+            spy = self.mkt.bars(["SPY"]).get("SPY")
+        if spy is None or len(spy) < 2:
+            return None
+        last = add_all(spy).iloc[-1]
+        return "up" if last["close"] >= last["vwap"] else "down"
 
     def status(self, symbols, bars, equity, last_equity, positions, market_open):
         """Heartbeat so a quiet log still shows the bot is alive and looking."""
@@ -214,6 +253,7 @@ class Bot:
         while time.time() < deadline:
             clock = self.mkt.clock()
             mins_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
+            self.mins_to_close = mins_to_close
             stocks_live = clock.is_open
             if clock.is_open and mins_to_close <= self.cfg.flatten_minutes_before_close:
                 stocks_live = False

@@ -148,8 +148,8 @@ class AlpacaBroker:
             log.debug("finnhub failed %s: %s", symbol, e)
         return None
 
-    def vwap(self, symbol: str) -> float | None:
-        """Today's volume-weighted average price from 1-minute bars (pre-market included)."""
+    def intraday(self, symbol: str):
+        """(VWAP, high of day) from today's 1-minute bars, pre-market included. (None, None) if unknown."""
         from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
@@ -157,13 +157,17 @@ class AlpacaBroker:
         try:
             bars = self.data.get_stock_bars(StockBarsRequest(
                 symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start, feed=DataFeed.IEX)).data.get(symbol, [])
+            if not bars:
+                return None, None
             vol = sum(b.volume for b in bars)
-            if vol <= 0:
-                return None
-            return sum((b.vwap or b.close) * b.volume for b in bars) / vol
+            vwap = sum((b.vwap or b.close) * b.volume for b in bars) / vol if vol > 0 else None
+            return vwap, max(b.high for b in bars)
         except Exception as e:
-            log.debug("vwap %s failed: %s", symbol, e)
-            return None
+            log.debug("intraday %s failed: %s", symbol, e)
+            return None, None
+
+    def vwap(self, symbol: str) -> float | None:
+        return self.intraday(symbol)[0]
 
     def shares_outstanding(self, symbol: str) -> float | None:
         """Shares outstanding (a stand-in for float). Finnhub first, then SEC filings. Cached."""

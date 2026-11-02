@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .catalysts import triage_form
+from .catalysts import is_common_stock_symbol, triage_form
 
 log = logging.getLogger("feeds")
 
@@ -138,6 +138,64 @@ class HaltWatch:
             await asyncio.sleep(61)        # Nasdaq asks for no more than once a minute
 
 
+# ---------------- Top gainers scanner ----------------
+def _ago(dt) -> str:
+    mins = max(0, int((datetime.now(timezone.utc) - dt).total_seconds() // 60))
+    return f"{mins} min ago" if mins < 120 else f"{mins // 60}h ago"
+
+
+def latest_headline(news_client, symbol: str):
+    """Most recent headline for a symbol in the last 24h, or None."""
+    from datetime import timedelta
+    from alpaca.data.requests import NewsRequest
+    res = news_client.get_news(NewsRequest(symbols=symbol, start=datetime.now(timezone.utc) - timedelta(hours=24),
+                                           limit=3, sort="desc"))
+    items = res.data.get("news", []) if hasattr(res, "data") else []
+    return items[0] if items else None
+
+
+async def movers_scanner(queue: asyncio.Queue, cfg, stop: asyncio.Event, screener=None, news=None):
+    """Every minute: today's biggest % gainers. Each new small-cap gainer becomes an event carrying its
+    latest headline, so it goes through exactly the same checks (traps, price, volume, AI, pullback)."""
+    from zoneinfo import ZoneInfo
+    from alpaca.data.requests import MarketMoversRequest
+    if screener is None:
+        from alpaca.data.historical.news import NewsClient
+        from alpaca.data.historical.screener import ScreenerClient
+        screener = ScreenerClient(cfg.alpaca_key, cfg.alpaca_secret)
+        news = NewsClient(cfg.alpaca_key, cfg.alpaca_secret)
+    ny = ZoneInfo("America/New_York")
+    seen: set[str] = set()
+    day = None
+    while not stop.is_set():
+        today = datetime.now(ny).date()
+        if day != today:
+            day, seen = today, set()
+        try:
+            movers = await asyncio.to_thread(screener.get_market_movers, MarketMoversRequest(top=cfg.scan_top))
+            for m in movers.gainers:
+                sym = m.symbol.upper()
+                if (sym in seen or not is_common_stock_symbol(sym)
+                        or not (cfg.min_price <= m.price <= cfg.max_price) or m.percent_change < cfg.min_gap_pct):
+                    continue
+                seen.add(sym)
+                try:
+                    n = await asyncio.to_thread(latest_headline, news, sym)
+                except Exception as e:
+                    log.debug("news lookup %s failed: %s", sym, e)
+                    n = None
+                if n is not None:
+                    at = n.created_at if n.created_at.tzinfo else n.created_at.replace(tzinfo=timezone.utc)
+                    text = (f"{n.headline}. {getattr(n, 'summary', '') or ''} "
+                            f"[Scanner: {sym} up {m.percent_change:+.0f}% today; this headline was published {_ago(at)}]")
+                else:
+                    text = f"[Scanner: {sym} up {m.percent_change:+.0f}% today; no news found in the last 24 hours]"
+                await queue.put(Event(sym, text[:500], "scanner", datetime.now(timezone.utc)))
+        except Exception as e:
+            log.debug("movers scan failed: %s", e)
+        await asyncio.sleep(cfg.scan_sec)
+
+
 # ---------------- Alpaca news websocket ----------------
 async def news_stream(queue: asyncio.Queue, cfg, stop: asyncio.Event):
     from alpaca.data.live.news import NewsDataStream
@@ -148,7 +206,7 @@ async def news_stream(queue: asyncio.Queue, cfg, stop: asyncio.Event):
             at = at.replace(tzinfo=timezone.utc)
         text = n.headline + (f". {n.summary}" if getattr(n, "summary", "") else "")
         for sym in (n.symbols or []):
-            if sym.isalpha() and len(sym) <= 5:
+            if is_common_stock_symbol(sym.upper()):
                 await queue.put(Event(sym.upper(), text[:500], "news", at))
 
     delay = 5

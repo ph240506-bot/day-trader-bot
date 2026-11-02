@@ -72,6 +72,10 @@ class SCConfig:
     trade_premarket: bool = field(default_factory=lambda: _e("SC_TRADE_PREMARKET", True, bool))
     exit_poll_sec: float = field(default_factory=lambda: _e("SC_EXIT_POLL_SEC", 2.0, float))
     edgar_poll_sec: float = field(default_factory=lambda: _e("SC_EDGAR_POLL_SEC", 15.0, float))
+    # Gainers scanner: catch small caps already jumping, then look up why (like a day trader's scanner)
+    scan_movers: bool = field(default_factory=lambda: _e("SC_SCAN_MOVERS", True, bool))
+    scan_sec: float = field(default_factory=lambda: _e("SC_SCAN_SEC", 60.0, float))
+    scan_top: int = field(default_factory=lambda: _e("SC_SCAN_TOP", 50, int))
 
     # AI: race several free models, first sensible answer wins
     llm_base_url: str = field(default_factory=lambda: _e("LLM_BASE_URL", "http://localhost:3001/v1"))

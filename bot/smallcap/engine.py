@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .broker import round_price
-from .catalysts import triage, triage_form
+from .catalysts import is_common_stock_symbol, triage, triage_form
 
 log = logging.getLogger("smallcap")
 NY = ZoneInfo("America/New_York")
@@ -52,13 +52,14 @@ class Watch:
     base: dict = field(default_factory=dict)
 
 
-def session(now_ny: datetime, is_open: bool) -> str:
-    """premarket | regular | closing | closed (New York time)."""
+def session(now_ny: datetime, is_open: bool, mins_to_close: float | None = None) -> str:
+    """premarket | regular | closing | closed (New York time).
+    mins_to_close comes from Alpaca's clock, so early-close days (e.g. after Thanksgiving) are handled."""
     t = now_ny.time()
     if is_open:
-        if t >= datetime.strptime("15:50", "%H:%M").time():
-            return "closing"
-        return "regular"
+        if mins_to_close is not None:
+            return "closing" if mins_to_close <= 10 else "regular"
+        return "closing" if t >= datetime.strptime("15:50", "%H:%M").time() else "regular"
     if now_ny.weekday() < 5 and datetime.strptime("04:00", "%H:%M").time() <= t < datetime.strptime("09:30", "%H:%M").time():
         return "premarket"
     return "closed"
@@ -101,6 +102,8 @@ class Engine:
         self.busy: set[str] = set()          # symbols being checked right now (no duplicate work)
         self.reserved = 0                     # buys in progress: count toward position/trade limits
         self._clock_cache = (None, 0.0)
+        self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
+        self.summary_day = None
         self.exit_failed: set[str] = set()
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         self.state_path = os.path.join(os.path.dirname(cfg.journal_path) or ".", "smallcap_positions.json")
@@ -137,6 +140,7 @@ class Engine:
             self.trap_today.clear()
             self.watching.clear()
             self.trades_today = 0
+            self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
 
     async def _call(self, fn, *a, **kw):
         return await asyncio.to_thread(fn, *a, **kw)
@@ -148,11 +152,16 @@ class Engine:
                    self.cfg.max_trades_per_day - self.trades_today - self.reserved)
 
     async def _session(self) -> str:
-        cached, at = self._clock_cache
-        if cached is None or time.time() - at > 15:        # market clock barely changes; save a request
-            cached = (await self._call(self.broker.clock))[0]
-            self._clock_cache = (cached, time.time())
-        return session(datetime.now(NY), cached)
+        clock, at = self._clock_cache
+        if clock is None or time.time() - at > 15:         # market clock barely changes; save a request
+            clock = await self._call(self.broker.clock)
+            self._clock_cache = (clock, time.time())
+        is_open, _, next_close, _ = clock
+        mins_to_close = None
+        if is_open and next_close is not None:
+            nc = next_close if next_close.tzinfo else next_close.replace(tzinfo=timezone.utc)
+            mins_to_close = (nc - datetime.now(timezone.utc)).total_seconds() / 60
+        return session(datetime.now(NY), is_open, mins_to_close)
 
     # ---------- the fast path ----------
     async def handle(self, ev):
@@ -164,6 +173,8 @@ class Engine:
         if len(self.seen) > 20000:
             self.seen.clear()
         sym = ev.symbol
+        if not is_common_stock_symbol(sym):
+            return "skip-asset"            # warrants, units, rights: not ordinary shares
 
         at = ev.at if ev.at.tzinfo else ev.at.replace(tzinfo=timezone.utc)
         if (datetime.now(timezone.utc) - at).total_seconds() > self.cfg.max_news_age_sec:
@@ -260,7 +271,18 @@ class Engine:
             return "pass"
 
         if cfg.entry_mode == "pullback":
-            self.watching[sym] = Watch(sym, time.time(), q.price, reason=reason, text=ev.text[:200], base=base)
+            # Start from today's real high, so a stock that spiked earlier and is already dipping counts.
+            vwap, day_high = await self._call(self.broker.intraday, sym)
+            w = Watch(sym, time.time(), max(q.price, day_high or 0), reason=reason, text=ev.text[:200], base=base,
+                      vwap=vwap, vwap_at=time.time())
+            if q.price <= w.high * (1 - cfg.pullback_max_pct / 100):
+                self.journal(**base, action="faded", reason=f"already {(1 - q.price / w.high) * 100:.0f}% off "
+                                                            f"today's high ${w.high:.2f}")
+                return "faded"
+            if q.price <= w.high * (1 - cfg.pullback_min_pct / 100):
+                w.state, w.low = "pulling", q.price
+            self.watching[sym] = w
+            self.day_stats["watched"] += 1
             self.journal(**base, action="watching", reason=reason)
             self.notify.send("veto", f"Watching {sym} {q.gap_pct:+.0f}% for a pullback",
                              f"${q.price:.2f}. AI: {reason}\nWill buy if it dips {cfg.pullback_min_pct:.0f}-"
@@ -371,7 +393,7 @@ class Engine:
                 continue
             if cfg.require_above_vwap:
                 if time.time() - w.vwap_at > 60:
-                    w.vwap, w.vwap_at = await self._call(self.broker.vwap, sym), time.time()
+                    w.vwap, w.vwap_at = (await self._call(self.broker.intraday, sym))[0], time.time()
                 if w.vwap is not None and q.price < w.vwap:
                     continue                 # bounced, but still below the day's average price: wait
             stop = round_price(w.low * (1 - cfg.stop_buffer_pct / 100))
@@ -447,6 +469,10 @@ class Engine:
         self.exit_failed.discard(p.symbol)
         avg = value / sold
         pnl = (avg - p.entry) * sold
+        self.day_stats["pnl"] += pnl
+        if remaining <= 1e-9:
+            self.day_stats["trades"] += 1
+            self.day_stats["wins"] += 1 if (avg - p.entry) > 0 else 0
         self.journal(symbol=p.symbol, source="exit", qty=sold, entry=p.entry, stop=p.stop, exit=round(avg, 4),
                      pnl=round(pnl, 2), action="sold" if remaining <= 0 else "partial-sell", reason=reason, text=p.text)
         self.notify.send("trade", f"SOLD {p.symbol} {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({reason})",
@@ -476,3 +502,18 @@ class Engine:
                 q = await self._call(self.broker.quote, p.symbol)
                 if q:
                     await self._exit(p, q, "daily loss limit", sess)
+
+    async def maybe_daily_summary(self):
+        """Once per trading day, after the close: one phone alert with how the day went."""
+        now = datetime.now(NY)
+        if now.weekday() >= 5 or now.hour < 16 or self.summary_day == now.date():
+            return
+        if await self._session() not in ("closed",):
+            return
+        self.summary_day = now.date()
+        st = self.day_stats
+        equity, last_equity = await self._call(self.broker.account)
+        wr = f"{st['wins']}/{st['trades']} wins" if st["trades"] else "no trades"
+        self.notify.send("alert", f"Small-cap day: {wr}, {'+' if st['pnl'] >= 0 else '-'}${abs(st['pnl']):.2f}",
+                         f"Watched {st['watched']} catalyst stocks. Account ${equity:,.2f} "
+                         f"({equity - last_equity:+,.2f} today).", 3, "bar_chart")

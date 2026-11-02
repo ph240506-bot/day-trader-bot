@@ -145,6 +145,7 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
         def has_open_order(self, s): return False
         def headlines(self, s): return ["09:45 Apple unveils new chip"]
         def enter(self, sym, side, plan): orders.append((sym, side, plan))
+        def latest_price(self, s): return None
 
     class FakeReviewer:
         def __init__(self, cfg): self.client = True
@@ -159,6 +160,7 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
         def refresh(self): return ["MOVR"]  # a mover with no bars must be harmless
     monkeypatch.setattr(m, "MoverScanner", FakeScanner)
     sent = []
+    monkeypatch.setattr(m.Bot, "_in_entry_window", lambda self: True)
     b = m.Bot(cfg)
     b.notify.send = lambda kind, title, msg, *a: sent.append((kind, title))
     b.tick(market_open=True)
@@ -266,3 +268,97 @@ def test_llm_parse_handles_fences_cutoff_and_thinking():
     full = '```json\n{"decision": "veto", "confidence": 0.9, "reason": "earnings today"}\n```'
     assert parse(full) == {"decision": "veto", "confidence": 0.9, "reason": "earnings today"}
     assert parse('<think>maybe {"decision":"approve"}? no.</think>{"decision":"veto","reason":"x"}')["decision"] == "veto"
+
+
+
+def _main_bot(monkeypatch, tmp_path, latest=None, spy_trend=None, window=True):
+    """A main bot on fake data with one fresh buy signal on AAPL."""
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    bars = downtrend_then_breakout()
+    bars = pd.concat([bars, make_bars([105.2]).set_index(bars.index[-1:] + pd.Timedelta("5min"))])
+    orders = []
+    spy = None
+    if spy_trend:
+        spy = make_bars(np.linspace(500, 510, 30) if spy_trend == "up" else np.linspace(510, 500, 30))
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity="100000", last_equity="100000")
+        def bars(self, syms):
+            out = {"AAPL": bars} if "AAPL" in syms or len(syms) > 1 else {}
+            if spy is not None and "SPY" in syms:
+                out["SPY"] = spy
+            return out
+        def positions(self): return {}
+        def has_open_order(self, s): return False
+        def headlines(self, s): return []
+        def enter(self, sym, side, plan): orders.append((sym, side, plan))
+        def latest_price(self, s): return latest
+
+    class FakeReviewer:
+        def __init__(self, cfg): self.client = True
+        def review(self, *a): return {"decision": "approve", "confidence": 1, "reason": "ok"}
+
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "Reviewer", FakeReviewer)
+    monkeypatch.setattr(m, "MoverScanner", lambda cfg, t: None)
+    monkeypatch.setattr(m.Bot, "_in_entry_window", lambda self: window)
+    b = m.Bot(Config())
+    b.cfg.stocks = ["AAPL"]
+    b.notify.send = lambda *a: None
+    return b, orders, bars
+
+
+def test_orders_are_repriced_from_latest_trade(monkeypatch, tmp_path):
+    probe, _, bars = _main_bot(monkeypatch, tmp_path)
+    sig_price = float(bars["close"].iloc[-2])
+    now_price = sig_price + 0.3
+    (tmp_path / "b").mkdir()
+    b, orders, _ = _main_bot(monkeypatch, tmp_path / "b", latest=now_price)
+    b.tick(market_open=True)
+    plan = orders[0][2]
+    assert plan.stop < now_price < plan.target              # built around the CURRENT price
+    assert abs((plan.target - now_price) - 2 * (now_price - plan.stop)) <= 0.02   # 2:1, within rounding
+
+
+def test_skips_when_price_ran_away(monkeypatch, tmp_path):
+    b, orders, _ = _main_bot(monkeypatch, tmp_path, latest=1000.0)
+    b.tick(market_open=True)
+    assert orders == []
+
+
+def test_entry_window_blocks_stock_entries(monkeypatch, tmp_path):
+    b, orders, _ = _main_bot(monkeypatch, tmp_path, window=False)
+    b.tick(market_open=True)
+    assert orders == []
+
+
+def test_market_filter(monkeypatch, tmp_path):
+    b, orders, _ = _main_bot(monkeypatch, tmp_path, spy_trend="down")    # market falling: no new longs
+    b.tick(market_open=True)
+    assert orders == []
+    (tmp_path / "up").mkdir()
+    b, orders, _ = _main_bot(monkeypatch, tmp_path / "up", spy_trend="up")
+    b.tick(market_open=True)
+    assert len(orders) == 1 and orders[0][1] == "buy"
+
+
+def test_entry_window_times(monkeypatch):
+    import bot.main as m
+    from datetime import datetime as real_dt
+    b = m.Bot.__new__(m.Bot)
+    b.cfg = Config()
+    def at(h, mi, to_close):
+        class FakeDT(real_dt):
+            @classmethod
+            def now(cls, tz=None): return real_dt(2026, 11, 3, h, mi, tzinfo=tz)
+        monkeypatch.setattr(m, "datetime", FakeDT)
+        b.mins_to_close = to_close
+        return b._in_entry_window()
+    assert at(9, 35, 385) is False       # first 10 minutes
+    assert at(9, 45, 375) is True
+    assert at(15, 40, 20) is False       # last 30 minutes
+    assert at(12, 40, 20) is False       # early-close day: 20 min left at 12:40

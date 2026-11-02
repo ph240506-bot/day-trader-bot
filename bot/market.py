@@ -47,6 +47,20 @@ class Market:
             log.warning("bar fetch failed: %s", e)
         return out
 
+    def latest_price(self, symbol: str) -> float | None:
+        """Price right now (the signal used the last finished candle, which can be minutes old)."""
+        try:
+            if is_crypto(symbol):
+                from alpaca.data.requests import CryptoLatestTradeRequest
+                t = self.crypto.get_crypto_latest_trade(CryptoLatestTradeRequest(symbol_or_symbols=symbol))
+            else:
+                from alpaca.data.requests import StockLatestTradeRequest
+                t = self.stocks.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX))
+            return float(t[symbol].price)
+        except Exception as e:
+            log.debug("latest price %s failed: %s", symbol, e)
+            return None
+
     def headlines(self, symbol: str) -> list[str]:
         try:
             q = symbol.split("/")[0]

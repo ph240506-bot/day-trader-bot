@@ -52,3 +52,10 @@ def triage_form(form: str) -> str:
     if form in CATALYST_FORMS:
         return "neutral"   # an 8-K can be anything; the AI reads the title/items
     return "ignore"
+
+
+def is_common_stock_symbol(sym: str) -> bool:
+    """Plain shares only. 5-letter Nasdaq tickers ending in W/U/R are warrants, units and rights."""
+    if not (sym.isalpha() and 1 <= len(sym) <= 5):
+        return False
+    return not (len(sym) == 5 and sym[-1] in "WUR")
