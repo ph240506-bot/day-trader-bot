@@ -256,3 +256,13 @@ def test_loss_limit_resets_next_day(monkeypatch, tmp_path):
     FakeMarket.equity = "100000"
     b.tick(market_open=False)
     assert not b.halted
+
+
+def test_llm_parse_handles_fences_cutoff_and_thinking():
+    # the exact reply from the phone alert: code fence + cut off mid-JSON
+    out = parse('```json\n{"decision": "approve", "confidence": 0.7, "reason": "trend and vol')
+    assert out["decision"] == "approve" and out["confidence"] == 0.7 and "cut off" in out["reason"]
+    assert parse('```json\n{"decision": "approve')["decision"] == "approve"
+    full = '```json\n{"decision": "veto", "confidence": 0.9, "reason": "earnings today"}\n```'
+    assert parse(full) == {"decision": "veto", "confidence": 0.9, "reason": "earnings today"}
+    assert parse('<think>maybe {"decision":"approve"}? no.</think>{"decision":"veto","reason":"x"}')["decision"] == "veto"

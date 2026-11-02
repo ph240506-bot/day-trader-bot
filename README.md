@@ -105,3 +105,29 @@ DRY_RUN=true python -m bot.main           # needs .env values exported
   volume numbers are lower than the full market's. Fine for signals, not a perfect picture.
 - Live trading is blocked unless you set `ALPACA_PAPER=false` **and**
   `LIVE_TRADING_ACK="I accept I can lose real money"`.
+
+
+## Small-cap catalyst mode (experimental, paper only)
+
+A second, separate engine (`bot/smallcap/`) that reacts to news within about a second:
+
+1. **Events arrive** from three free sources: the Alpaca news websocket (Benzinga headlines, pushed
+   live), SEC EDGAR filings (8-K news plus offering forms, polled every 15s) and the Nasdaq halt feed.
+2. **Instant rule check** (microseconds): offerings, ATM programs, warrants, reverse splits, delisting
+   notices are rejected on the spot. If a stock files an offering today, later "good news" on it is ignored.
+3. **Price check**: $1-20, already up 8%+, volume above yesterday's, buy/sell gap under 2%, not halted.
+4. **AI race**: several free models (via freellmapi) get the headline at once; the first valid answer
+   wins. No answer within 4s = no trade.
+5. **Share count**: skips companies with more than 50M shares (Finnhub or SEC data).
+6. **Watch for the first pullback** (the classic small-cap day-trader entry): track the spike high,
+   wait for a 3-15% dip, buy when it bounces 1.5% off the low while above VWAP. Gives up after 20 minutes.
+7. **Limit buy** (never a market order), sized so a stop-out loses at most 1% of the account, max $200.
+8. **Managed exit**: stop just under the pullback low, 2x-risk target, trailing stop once up 6%,
+   30-minute time limit, flat before the close.
+
+Turn it on by entering a second Alpaca paper account's keys in `scripts/pi_setup.sh`. It journals
+every decision to `journal/smallcap.csv` with the time it took, and phone alerts show buys, sells and passes.
+
+**Limits to keep in mind:** the free price feed (IEX) sees only a small slice of small-cap trading, so
+quotes can be stale or missing; paper fills on thin stocks are far kinder than real ones; halts can
+skip straight past a stop.

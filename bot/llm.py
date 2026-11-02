@@ -39,7 +39,7 @@ class Reviewer:
             resp = self.client.chat.completions.create(
                 model=self.cfg.llm_model,
                 temperature=0.1,
-                max_tokens=200,
+                max_tokens=800,   # room for 'thinking' models; normal ones stop after ~40 tokens
                 messages=[{"role": "system", "content": SYSTEM},
                           {"role": "user", "content": json.dumps(payload)}],
             )
@@ -56,14 +56,34 @@ class Reviewer:
         return {"decision": decision, "confidence": 0.0, "reason": f"LLM skipped ({why})"}
 
 
+def _clean(text: str) -> str:
+    text = re.sub(r"<think>.*?(</think>|$)", "", text or "", flags=re.S | re.I)   # inline reasoning
+    return text.replace("```json", "").replace("```", "")
+
+
 def parse(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise ValueError(f"no JSON in LLM reply: {text[:80]!r}")
-    data = json.loads(m.group(0))
+    """Read the AI's verdict, even if the reply is wrapped in code fences or got cut off."""
+    t = _clean(text)
+    m = re.search(r"\{.*\}", t, re.S)
+    data = None
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            data = None
+    if data is None:   # cut-off reply: pull the fields out directly
+        d = re.search(r'"decision"\s*:\s*"(approve|veto)', t, re.I)
+        if not d:
+            raise ValueError(f"no verdict in LLM reply: {t.strip()[:80]!r}")
+        c = re.search(r'"confidence"\s*:\s*([0-9.]+)', t)
+        r = re.search(r'"reason"\s*:\s*"([^"]*)', t)
+        data = {"decision": d.group(1), "confidence": c.group(1) if c else 0,
+                "reason": (r.group(1) if r else "") + " (reply was cut off)"}
     decision = str(data.get("decision", "veto")).lower()
     if decision not in ("approve", "veto"):
         decision = "veto"
-    return {"decision": decision,
-            "confidence": float(data.get("confidence", 0) or 0),
-            "reason": str(data.get("reason", ""))[:300]}
+    try:
+        conf = float(data.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {"decision": decision, "confidence": conf, "reason": str(data.get("reason", ""))[:300]}

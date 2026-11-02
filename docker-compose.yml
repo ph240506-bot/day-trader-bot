@@ -34,5 +34,20 @@ services:
       - ./journal:/app/journal
     logging: *logging
 
+  smallcap:
+    # Small-cap catalyst mode, on its own Alpaca paper account. Turned on by COMPOSE_PROFILES=smallcap in .env.
+    build: .
+    command: ["python", "-m", "bot.smallcap.main"]
+    profiles: ["smallcap"]
+    restart: unless-stopped
+    depends_on: [freellmapi]
+    env_file: .env
+    environment:
+      LLM_BASE_URL: http://freellmapi:3001/v1
+      TZ: Australia/Melbourne
+    volumes:
+      - ./journal:/app/journal
+    logging: *logging
+
 volumes:
   freellmapi-data:
