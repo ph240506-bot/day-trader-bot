@@ -932,3 +932,31 @@ def test_orders_are_never_retried():
     from bot.smallcap.broker import AlpacaBroker
     for name in ("limit", "market_sell"):
         assert not hasattr(getattr(AlpacaBroker, name), "__wrapped__"), f"{name} must not auto-retry"
+
+
+def test_report_crypto_fee_residue_closes_trade():
+    """Real fills: Alpaca kept 0.25% of the BTC as a fee, so each sell was smaller than its buy."""
+    from bot.report import round_trips, summarize
+    fills = [
+        {"symbol": "BTC/USD", "side": "buy", "qty": "0.056812", "price": "78036.30", "transaction_time": "2026-11-03T14:36:00Z"},
+        {"symbol": "BTC/USD", "side": "sell", "qty": "0.056669969", "price": "77617.15", "transaction_time": "2026-11-03T14:51:00Z"},
+        {"symbol": "BTC/USD", "side": "buy", "qty": "0.056804", "price": "77912.36", "transaction_time": "2026-11-03T15:46:00Z"},
+        {"symbol": "BTC/USD", "side": "sell", "qty": "0.056661988", "price": "77501.41", "transaction_time": "2026-11-03T15:55:00Z"},
+    ]
+    trades = round_trips(fills)
+    assert len(trades) == 2
+    expected = (77617.15 - 78036.30) * 0.056669969 - (0.056812 - 0.056669969) * 78036.30
+    assert abs(trades[0]["pnl"] - round(expected, 2)) < 0.011
+    assert trades[0]["fees"] > 10
+    text = "\n".join(summarize(trades))
+    assert "Trades: 2" in text and "Crypto fees" in text
+
+
+def test_report_real_partial_close_not_treated_as_fee():
+    """A genuine half sell (50% left) must stay open, not be written off as a fee."""
+    from bot.report import round_trips
+    fills = [
+        {"symbol": "AAPL", "side": "buy", "qty": "10", "price": "100", "transaction_time": "2026-11-03T14:00:00Z"},
+        {"symbol": "AAPL", "side": "sell", "qty": "5", "price": "101", "transaction_time": "2026-11-03T14:10:00Z"},
+    ]
+    assert round_trips(fills) == []

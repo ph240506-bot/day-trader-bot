@@ -58,6 +58,9 @@ class Config:
     market_filter: bool = field(default_factory=lambda: _env("MARKET_FILTER", True, bool))
     # Skip if price moved more than this many ATRs between the signal candle and the order.
     max_chase_atr: float = field(default_factory=lambda: _env("MAX_CHASE_ATR", 1.0, float))
+    # Alpaca charges ~0.25% per crypto trade each way (0.5% round trip). Only take crypto trades whose
+    # target is at least this far away, so a win actually beats the fees.
+    min_crypto_target_pct: float = field(default_factory=lambda: _env("MIN_CRYPTO_TARGET_PCT", 1.5, float))
 
     # Risk
     risk_per_trade_pct: float = field(default_factory=lambda: _env("RISK_PER_TRADE_PCT", 0.5, float))

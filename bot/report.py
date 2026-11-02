@@ -16,7 +16,8 @@ def round_trips(fills: list[dict]) -> list[dict]:
     (e.g. old holdings sold at the open): it is ignored, never mistaken for a new short.
     Only 'sell_short' opens a short."""
     trades = []
-    book = defaultdict(lambda: {"lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0, "active": False})
+    book = defaultdict(lambda: {"lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0, "active": False,
+                                "opened_qty": 0.0, "fees": 0.0})
     for f in sorted(fills, key=lambda x: x["transaction_time"]):
         sym = f["symbol"].replace("/", "")
         qty, price, side = float(f["qty"]), float(f["price"]), f["side"]
@@ -32,16 +33,24 @@ def round_trips(fills: list[dict]) -> list[dict]:
                 b["lots"].pop(0)
             else:
                 b["lots"][0][0] = lot_qty - take
+        # Crypto: Alpaca takes its fee out of the coins bought, so the sell is ~0.25% smaller than the buy.
+        # A leftover of <=1% of what was opened is that fee: treat the trade as closed and charge it.
+        if b["active"] and b["lots"] and remaining <= 1e-9 and sum(l[0] for l in b["lots"]) <= 0.01 * b["opened_qty"]:
+            b["pnl"] -= sum(l[0] * l[2] for l in b["lots"])
+            b["fees"] += sum(l[0] * l[2] for l in b["lots"])
+            b["lots"] = []
         if b["active"] and not b["lots"]:                                               # back to flat
             trades.append({"symbol": sym, "side": b["side"], "pnl": round(b["pnl"], 2), "opened": b["opened"],
-                           "closed": f["transaction_time"], "cost": round(b["cost"], 2)})
+                           "closed": f["transaction_time"], "cost": round(b["cost"], 2),
+                           "fees": round(b["fees"], 2)})
             b["active"] = False
         if remaining > 1e-9:
             if side == "sell" and not b["active"]:
                 continue                                     # plain sell, nothing open: pre-window holding
             if not b["active"]:
-                b.update(active=True, pnl=0.0, cost=0.0, opened=f["transaction_time"],
+                b.update(active=True, pnl=0.0, cost=0.0, opened=f["transaction_time"], opened_qty=0.0, fees=0.0,
                          side="long" if sign > 0 else "short")
+            b["opened_qty"] += remaining
             b["lots"].append([remaining, sign, price])
             b["cost"] += remaining * price
     return trades
@@ -61,6 +70,9 @@ def summarize(trades: list[dict]) -> list[str]:
         f"Avg win: ${gross_win / len(wins) if wins else 0:,.2f}   Avg loss: -${gross_loss / len(losses) if losses else 0:,.2f}",
         f"  Profit factor: {gross_win / gross_loss:.2f}" if gross_loss > 0 else "  Profit factor: n/a (no losses)",
     ]
+    fees = sum(t.get("fees", 0) for t in trades)
+    if fees:
+        lines.append(f"  Crypto fees (included above): ${fees:,.2f}")
     best, worst = max(trades, key=lambda t: t["pnl"]), min(trades, key=lambda t: t["pnl"])
     lines.append(f"  Best: {best['symbol']} {best['side']} +${best['pnl']:,.2f}   "
                  f"Worst: {worst['symbol']} {worst['side']} ${worst['pnl']:,.2f}")

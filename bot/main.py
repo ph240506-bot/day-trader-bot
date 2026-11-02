@@ -151,6 +151,10 @@ class Bot:
                 log.info("Skip %s %s: price moved %.2f -> %.2f since the signal", sig.side, sym, sig.price, px)
                 continue
             plan = plan_order(sig.side, px, sig.atr, equity, self.cfg, fractional=is_crypto(sym))
+            if plan and is_crypto(sym) and abs(plan.target - px) / px * 100 < self.cfg.min_crypto_target_pct:
+                log.info("Skip %s %s: target only %.2f%% away, too small to beat ~0.5%% crypto fees",
+                         sig.side, sym, abs(plan.target - px) / px * 100)
+                continue
             row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
                    "side": sig.side, "score": sig.score, "price": sig.price,
                    "llm_decision": verdict["decision"], "llm_reason": verdict["reason"],
