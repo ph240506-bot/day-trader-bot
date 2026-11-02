@@ -646,3 +646,43 @@ def test_null_snapshot_from_alpaca(alpaca, monkeypatch):
         return orig(self)
     monkeypatch.setattr(FakeAlpaca, "do_GET", with_null)
     assert broker.quotes(["NULLX"]) == {}
+
+
+def test_burst_of_headlines_all_get_checked(tmp_path):
+    """The bug from the first live night: 4 events at once with room for 3 positions made the
+    4th skip with 'skip-limits' while nothing was held. Every event must now be evaluated."""
+    from bot.smallcap.main import worker
+
+    class SlowBroker(FakeBroker):
+        def quote(self, s):
+            time.sleep(0.3)                    # real API round trip
+            return super().quote(s)
+
+    b = SlowBroker(mover(price=180, prev=150))          # big caps: filtered on price
+    b.per_symbol["RUNR"] = mover()                      # the one real small-cap mover
+    e = Engine(cfg(tmp_path, max_positions=3), b, FakeBrain(STRONG), Sink())
+
+    async def go():
+        q, stats = asyncio.Queue(), {}
+        ws = [asyncio.create_task(worker(q, e, stats)) for _ in range(4)]
+        for s in ["BIGA", "BIGB", "BIGC", "BIGD", "BIGE", "RUNR"]:
+            await q.put(ev(s, f"{s} receives FDA approval"))
+        await q.join()
+        for w in ws:
+            w.cancel()
+        return stats
+    stats = run(go())
+    assert stats.get("skip-limits", 0) == 0 and stats["skip-price"] == 5 and stats["bought"] == 1
+    assert "RUNR" in e.positions and e.reserved == 0
+
+
+def test_clock_is_cached(tmp_path):
+    class CountingBroker(FakeBroker):
+        calls = 0
+        def clock(self):
+            CountingBroker.calls += 1
+            return super().clock()
+    e = Engine(cfg(tmp_path), CountingBroker(mover(price=180, prev=150)), FakeBrain(STRONG), Sink())
+    for i in range(5):
+        run(e.handle(ev(f"BIG{i}", f"BIG{i} receives FDA approval")))
+    assert CountingBroker.calls == 1

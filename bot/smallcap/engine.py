@@ -98,7 +98,9 @@ class Engine:
         self.trades_today = 0
         self.day = None
         self.halted_day = None
-        self.busy: set[str] = set()
+        self.busy: set[str] = set()          # symbols being checked right now (no duplicate work)
+        self.reserved = 0                     # buys in progress: count toward position/trade limits
+        self._clock_cache = (None, 0.0)
         self.exit_failed: set[str] = set()
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         self.state_path = os.path.join(os.path.dirname(cfg.journal_path) or ".", "smallcap_positions.json")
@@ -140,9 +142,17 @@ class Engine:
         return await asyncio.to_thread(fn, *a, **kw)
 
     def _slots_left(self) -> int:
-        in_flight = len(self.busy)
-        return min(self.cfg.max_positions - len(self.positions) - in_flight,
-                   self.cfg.max_trades_per_day - self.trades_today - in_flight)
+        """Free slots. Only buys actually in progress count, not stocks still being checked:
+        a burst of headlines must all get looked at, even if only a few can be bought."""
+        return min(self.cfg.max_positions - len(self.positions) - self.reserved,
+                   self.cfg.max_trades_per_day - self.trades_today - self.reserved)
+
+    async def _session(self) -> str:
+        cached, at = self._clock_cache
+        if cached is None or time.time() - at > 15:        # market clock barely changes; save a request
+            cached = (await self._call(self.broker.clock))[0]
+            self._clock_cache = (cached, time.time())
+        return session(datetime.now(NY), cached)
 
     # ---------- the fast path ----------
     async def handle(self, ev):
@@ -193,8 +203,7 @@ class Engine:
 
     async def _evaluate(self, ev, rule, matched):
         sym, cfg = ev.symbol, self.cfg
-        is_open, *_ = await self._call(self.broker.clock)
-        sess = session(datetime.now(NY), is_open)
+        sess = await self._session()
         if sess not in ("regular", "premarket") or (sess == "premarket" and not cfg.trade_premarket):
             return "skip-session"
         if not await self._call(self.broker.asset_ok, sym):
@@ -262,6 +271,17 @@ class Engine:
 
     # ---------- entering ----------
     async def _enter(self, sym, q, stop, sess, base, reason, text):
+        # Check-and-reserve with no await in between, so parallel buys can't overshoot the limits.
+        if self._slots_left() <= 0:
+            self.journal(**base, action="skipped", reason="position/trade limit reached")
+            return "skip-limits"
+        self.reserved += 1
+        try:
+            return await self._enter_reserved(sym, q, stop, sess, base, reason, text)
+        finally:
+            self.reserved -= 1
+
+    async def _enter_reserved(self, sym, q, stop, sess, base, reason, text):
         cfg = self.cfg
         equity, _ = await self._call(self.broker.account)
         ask = q.ask if q.ask > 0 else q.price
@@ -322,8 +342,7 @@ class Engine:
         symbols = list(dict.fromkeys(list(self.positions) + list(self.watching)))
         if not symbols:
             return
-        is_open, *_ = await self._call(self.broker.clock)
-        sess = session(datetime.now(NY), is_open)
+        sess = await self._session()
         quotes = await self._call(self.broker.quotes, symbols, finnhub_for=set(self.positions))
         await self.manage_exits(quotes, sess)
         await self.manage_watch(quotes, sess)
