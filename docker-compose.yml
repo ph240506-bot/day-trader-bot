@@ -1,32 +1,38 @@
-# Always-on option: an Oracle Cloud "Always Free" VM (or a Raspberry Pi / old laptop).
-# 1. cp .env.example .env  and fill it in
-# 2. docker compose up -d freellmapi
-# 3. open http://<vm>:3001 via an SSH tunnel, add free provider keys, copy the unified key into .env as LLM_API_KEY
-#    (or set GROQ_API_KEY etc. in .env and run scripts/build_freellmapi_config.py, see README)
-# 4. docker compose up -d bot
-# The bot loops forever: it sleeps while the market is shut and restarts itself daily.
+# 24/7 on a Raspberry Pi, old laptop or Oracle Cloud Always Free VM.
+# Don't edit this. Run:  bash scripts/pi_setup.sh
+# It asks for your keys, writes .env, starts freellmapi, grabs its key and starts the bot.
+# Both containers restart themselves after crashes, power cuts and reboots.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }   # keeps logs from filling the SD card
+
 services:
   freellmapi:
     image: ghcr.io/tashfeenahmed/freellmapi:latest
     restart: unless-stopped
     environment:
-      ENCRYPTION_KEY: ${FREELLMAPI_ENCRYPTION_KEY}
+      ENCRYPTION_KEY: ${FREELLMAPI_ENCRYPTION_KEY:?run scripts/pi_setup.sh first}
+      # Only set during setup (loads your provider keys); keys then live encrypted in the volume.
+      FREEAPI_CONFIG_JSON: ${FREEAPI_CONFIG_JSON:-}
     ports:
       - "127.0.0.1:3001:3001"
     volumes:
       - freellmapi-data:/app/server/data
+    logging: *logging
 
   bot:
     build: .
-    restart: always
+    restart: unless-stopped
     depends_on: [freellmapi]
     env_file: .env
     environment:
       LLM_BASE_URL: http://freellmapi:3001/v1
-      MAX_RUNTIME_MINUTES: "1440"   # one day, then Docker restarts it fresh
-      WAIT_FOR_OPEN_MINUTES: "1440"
+      TZ: Australia/Melbourne              # log timestamps in your time
+      MAX_RUNTIME_MINUTES: "5000000"      # effectively forever
+      WAIT_FOR_OPEN_MINUTES: "5000000"    # never exit just because the market is shut
     volumes:
       - ./journal:/app/journal
+    logging: *logging
 
 volumes:
   freellmapi-data:

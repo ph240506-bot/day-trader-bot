@@ -215,3 +215,44 @@ def test_notifier_never_raises(monkeypatch):
     from bot.notify import Notifier
     monkeypatch.setenv("NTFY_TOPIC", "t"); monkeypatch.setenv("NTFY_SERVER", "http://127.0.0.1:9")
     Notifier(Config()).send("trade", "x", "y")  # server down: must not crash the bot
+
+
+def test_crypto_exits_survive_restart(monkeypatch, tmp_path):
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "MoverScanner", lambda cfg, t: None)
+    b = m.Bot(Config())
+    b.crypto_exits["BTCUSD"] = ("buy", 70000.0, 74000.0)
+    b._save_exits()
+    assert m.Bot(Config()).crypto_exits == {"BTCUSD": ("buy", 70000.0, 74000.0)}
+
+
+def test_loss_limit_resets_next_day(monkeypatch, tmp_path):
+    import datetime as dt
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("TRADE_CRYPTO", "false")
+
+    class FakeMarket:
+        trading = None
+        equity = "97000"
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity=FakeMarket.equity, last_equity="100000")
+        def flatten_all(self): pass
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "MoverScanner", lambda cfg, t: None)
+    b = m.Bot(Config())
+    b.notify.send = lambda *a: None
+    b.tick(market_open=False)
+    assert b.halted
+    b.halted_on = dt.date(2000, 1, 1)   # pretend it fired on an earlier day
+    FakeMarket.equity = "100000"
+    b.tick(market_open=False)
+    assert not b.halted

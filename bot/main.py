@@ -1,9 +1,11 @@
 """Main loop: every minute, pull fresh bars, look for setups, ask the LLM, size, trade, journal."""
 import csv
+import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from .config import Config
 from .llm import Reviewer
@@ -15,6 +17,7 @@ from .strategy import chart_summary, evaluate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
+NY = ZoneInfo("America/New_York")
 
 JOURNAL_FIELDS = ["time", "symbol", "side", "score", "price", "qty", "stop", "target",
                   "llm_decision", "llm_reason", "action", "reasons"]
@@ -29,9 +32,27 @@ class Bot:
         self.crypto_exits: dict[str, tuple[str, float, float]] = {}  # symbol -> (side, stop, target)
         self.seen: set[tuple[str, str]] = set()  # (symbol, bar time) already handled
         self.halted = False
+        self.halted_on = None  # New York date the loss limit fired; resets next trading day
         self._last_status = 0.0
         self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
+        # Crypto stops/targets live here so a restart doesn't leave a position unmanaged.
+        self.state_path = os.path.join(os.path.dirname(cfg.journal_path) or ".", "crypto_exits.json")
+        self.crypto_exits = self._load_exits()
+
+    def _load_exits(self):
+        try:
+            with open(self.state_path) as f:
+                return {k: tuple(v) for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_exits(self):
+        try:
+            with open(self.state_path, "w") as f:
+                json.dump(self.crypto_exits, f)
+        except OSError as e:
+            log.warning("could not save crypto exits: %s", e)
 
     # ---------- journal ----------
     def journal(self, row: dict):
@@ -47,6 +68,10 @@ class Bot:
         acct = self.mkt.account()
         equity, last_equity = float(acct.equity), float(acct.last_equity)
 
+        today = datetime.now(NY).date()
+        if self.halted and self.halted_on != today:
+            log.info("New trading day: daily loss limit reset.")
+            self.halted = False
         if not self.halted and daily_loss_hit(equity, last_equity, self.cfg):
             log.error("Daily loss limit hit (equity %.2f vs %.2f). Flattening and stopping new trades.",
                       equity, last_equity)
@@ -56,6 +81,7 @@ class Bot:
                              f"Account down {(equity - last_equity) / last_equity * 100:.1f}% today "
                              f"(${equity:,.0f}). Closed everything, no new trades today.", 5, "rotating_light")
             self.halted = True
+            self.halted_on = today
         if self.halted:
             return
 
@@ -122,6 +148,7 @@ class Bot:
                     positions[pos_key] = True  # count it toward the cap this pass
                     if is_crypto(sym):
                         self.crypto_exits[pos_key] = (sig.side, plan.stop, plan.target)
+                        self._save_exits()
                     log.info("ORDER %s %s x%s stop %.2f target %.2f", sig.side, sym, plan.qty, plan.stop, plan.target)
                     self.notify.send(
                         "trade", f"{'BUY' if sig.side == 'buy' else 'SHORT'} {sym} x{plan.qty}",
@@ -152,6 +179,7 @@ class Bot:
         for pos_key, (side, stop, target) in list(self.crypto_exits.items()):
             if pos_key not in positions:
                 self.crypto_exits.pop(pos_key)
+                self._save_exits()
                 continue
             sym = next((s for s in bars if s.replace("/", "") == pos_key), None)
             if not sym:
@@ -166,6 +194,7 @@ class Bot:
                 if not self.cfg.dry_run:
                     self.mkt.close(sym)
                 self.crypto_exits.pop(pos_key)
+                self._save_exits()
 
     # ---------- session ----------
     def run(self):
@@ -198,6 +227,7 @@ class Bot:
                     if not self.cfg.dry_run:
                         self.mkt.flatten_all()
                     self.crypto_exits.clear()
+                    self._save_exits()
                     flattened_for = clock.timestamp.date()
             if not clock.is_open and not self.cfg.trade_crypto:
                 wait = (clock.next_open - clock.timestamp).total_seconds()
@@ -217,6 +247,8 @@ class Bot:
                     self.mkt.close(pos_key)
                 except Exception as e:
                     log.error("could not close %s: %s", pos_key, e)
+            self.crypto_exits.clear()
+            self._save_exits()
         log.info("Bot stopped after %.0f min.", (time.time() - started) / 60)
 
 
