@@ -72,6 +72,8 @@ class Config:
     llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "http://localhost:3001/v1"))
     llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY", ""))
     llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "auto"))
+    # Tried in order until one gives a readable answer (auto:fast avoids slow "thinking" models).
+    llm_models: list = field(default_factory=lambda: [m.strip() for m in _env("LLM_MODELS", "auto:fast,auto").split(",") if m.strip()])
     # If the LLM can't be reached: True = skip the trade (safer), False = trade on indicators alone.
     llm_required: bool = field(default_factory=lambda: _env("LLM_REQUIRED", True, bool))
 

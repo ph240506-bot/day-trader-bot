@@ -17,7 +17,8 @@ SYSTEM = (
     "Decide whether to APPROVE or VETO it using only the data given. Veto if headlines suggest "
     "event risk (earnings today, halts, lawsuits, guidance cuts for a long; strong positive catalysts "
     "for a short), if the chart numbers contradict the setup, or if anything is unclear. "
-    'Reply with JSON only: {"decision": "approve"|"veto", "confidence": 0.0-1.0, "reason": "<one sentence>"}'
+    "Do NOT think out loud or explain your steps. Your entire reply must be one JSON object: "
+    '{"decision": "approve"|"veto", "confidence": 0.0-1.0, "reason": "<one sentence>"}'
 )
 
 
@@ -35,21 +36,25 @@ class Reviewer:
             "chart_5min": chart,
             "recent_headlines": headlines[:8] or ["(none in the last 24h)"],
         }
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.cfg.llm_model,
-                temperature=0.1,
-                max_tokens=800,   # room for 'thinking' models; normal ones stop after ~40 tokens
-                messages=[{"role": "system", "content": SYSTEM},
-                          {"role": "user", "content": json.dumps(payload)}],
-            )
-            text = resp.choices[0].message.content or ""
-            out = parse(text)
-            log.info("LLM %s on %s %s: %s", out["decision"], signal.side, signal.symbol, out["reason"])
-            return out
-        except Exception as e:  # network, rate limit, bad JSON
-            log.warning("LLM unavailable: %s", e)
-            return self._fallback(str(e)[:120])
+        models = self.cfg.llm_models or [self.cfg.llm_model]
+        last_err = "no models configured"
+        for model in models:                      # first readable answer wins
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    temperature=0.1,
+                    max_tokens=800,   # room for 'thinking' models; normal ones stop after ~40 tokens
+                    messages=[{"role": "system", "content": SYSTEM},
+                              {"role": "user", "content": json.dumps(payload)}],
+                )
+                text = resp.choices[0].message.content or ""
+                out = parse(text)
+                log.info("LLM %s on %s %s (%s): %s", out["decision"], signal.side, signal.symbol, model, out["reason"])
+                return out
+            except Exception as e:  # network, rate limit, unreadable reply -> try the next model
+                last_err = str(e)[:120]
+                log.warning("LLM %s unusable for %s: %s", model, signal.symbol, last_err)
+        return self._fallback(last_err)
 
     def _fallback(self, why):
         decision = "veto" if self.cfg.llm_required else "approve"

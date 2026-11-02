@@ -42,7 +42,10 @@ async def worker(queue, engine, stats):
                 log.info("%s %s [%s] -> %s (%.0f ms) %s", ev.source, ev.symbol, ev.form or "news", action,
                          (time.time() - ev.received) * 1000, ev.text[:90])
         except Exception as e:
-            log.exception("event %s failed: %s", ev.symbol, e)
+            if any(w in type(e).__name__ + str(e) for w in ("Connection", "Timeout", "RemoteDisconnected")):
+                log.warning("event %s skipped: network hiccup (%s)", ev.symbol, type(e).__name__)
+            else:
+                log.exception("event %s failed: %s", ev.symbol, e)
         finally:
             queue.task_done()
 
@@ -96,6 +99,9 @@ async def run():
         except NotImplementedError:
             pass
 
+    # Checks are network-bound: more threads so a burst of headlines doesn't queue up.
+    from concurrent.futures import ThreadPoolExecutor
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
     stats: dict[str, int] = {}
     log.info("Small-cap mode starting. paper=%s dry_run=%s entry=%s AI=%s models=%s finnhub=%s sec=%s scanner=%s",
              cfg.paper, cfg.dry_run, cfg.entry_mode, "on" if brain.client else "off", ",".join(cfg.llm_models),
@@ -105,7 +111,7 @@ async def run():
         news_stream(queue, cfg, stop), edgar_poller(queue, cfg, stop), halts.run(cfg, stop),
         exit_loop(engine, cfg, stop), heartbeat(engine, broker, stats, stop),
         *([movers_scanner(queue, cfg, stop)] if cfg.scan_movers else []),
-        *[worker(queue, engine, stats) for _ in range(4)])]
+        *[worker(queue, engine, stats) for _ in range(12)])]
     await stop.wait()
     log.info("Stopping; open positions stay managed on restart (saved to disk).")
     for t in tasks:

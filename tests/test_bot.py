@@ -362,3 +362,26 @@ def test_entry_window_times(monkeypatch):
     assert at(9, 45, 375) is True
     assert at(15, 40, 20) is False       # last 30 minutes
     assert at(12, 40, 20) is False       # early-close day: 20 min left at 12:40
+
+
+def test_llm_tries_next_model_when_reply_unreadable(monkeypatch):
+    """Night 1: a free model 'thought out loud' and never gave an answer -> bot vetoed good setups."""
+    from bot.llm import Reviewer
+    from bot.strategy import Signal
+    replies = {"auto:fast": "The user wants me to act as a cautious intraday trading risk reviewer and I need to",
+               "auto": '{"decision": "approve", "confidence": 0.8, "reason": "trend and volume agree"}'}
+    asked = []
+
+    class FakeCompletions:
+        def create(self, model, **kw):
+            asked.append(model)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=replies[model]))])
+
+    monkeypatch.setenv("LLM_API_KEY", "x")
+    r = Reviewer(Config())
+    r.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    out = r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])
+    assert asked == ["auto:fast", "auto"] and out["decision"] == "approve"
+    replies["auto"] = "still thinking..."
+    out = r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])
+    assert out["decision"] == "veto" and "LLM skipped" in out["reason"]

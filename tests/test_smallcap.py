@@ -863,3 +863,72 @@ def test_report_account_block_handles_alpaca_down(tmp_path, monkeypatch):
     monkeypatch.setattr(r, "fetch_fills", boom)
     out = "\n".join(r.account_block("Main bot", "k", "s", True, 1, str(tmp_path / "none.csv"), "main"))
     assert "Couldn't reach Alpaca" in out and "no journal entries" in out
+
+
+# ======================= v8.1: fixes from the first live night =======================
+def test_report_ignores_sales_of_old_holdings():
+    """Night 1: the 8 old positions sold at the open were mistaken for new shorts, hiding the real trades."""
+    from bot.report import round_trips
+    t = lambda m: f"2026-11-03T14:{m:02d}:00Z"
+    fills = [
+        {"symbol": "NVDA", "side": "sell", "qty": "19.366", "price": "180", "transaction_time": t(0)},  # old holding
+        {"symbol": "XOM", "side": "sell", "qty": "0.00000057", "price": "110", "transaction_time": t(0)},
+        {"symbol": "NVDA", "side": "buy", "qty": "5", "price": "181", "transaction_time": t(10)},       # bot's trade
+        {"symbol": "NVDA", "side": "sell", "qty": "5", "price": "183", "transaction_time": t(20)},
+        {"symbol": "AMD", "side": "buy", "qty": "10", "price": "150", "transaction_time": t(11)},
+        {"symbol": "AMD", "side": "sell", "qty": "10", "price": "149", "transaction_time": t(30)},
+    ]
+    trades = round_trips(fills)
+    assert sorted((x["symbol"], x["pnl"]) for x in trades) == [("AMD", -10.0), ("NVDA", 10.0)]
+
+
+def test_report_order_outcomes():
+    from bot.report import order_lines
+    from types import SimpleNamespace as NS
+    now = datetime.now(timezone.utc)
+    o = lambda st, sym: NS(status=NS(value=st), side=NS(value="buy"), type=NS(value="market"), symbol=sym,
+                           qty="5", notional=None, submitted_at=now, filled_avg_price=None, limit_price=None, stop_price=None)
+    out = "\n".join(order_lines([o("filled", "NVDA"), o("rejected", "AMD"), o("canceled", "TSLA")], 2))
+    assert "Orders: 3" in out and "rejected 1" in out and "Fills: 2" in out and "AMD x5 market -> rejected" in out
+
+
+def test_volume_pace_adjusted():
+    from bot.smallcap.broker import session_fraction
+    d = datetime(2026, 11, 3, 10, 35, tzinfo=NY)          # 65 min into a 390-min session
+    assert abs(session_fraction(d) - 65 / 390) < 1e-9
+    assert session_fraction(d.replace(hour=9, minute=31)) == 0.1      # floor in the first minutes
+    assert session_fraction(d.replace(hour=17)) == 1.0
+    q = Quote(4.0, 3.0, 3.99, 4.01, day_volume=200_000, prev_volume=1_000_000)
+    import bot.smallcap.broker as br
+    orig = br.session_fraction
+    br.session_fraction = lambda now=None: 65 / 390
+    try:
+        assert round(q.rel_volume, 2) == 1.2                  # 20% of yesterday by 10:35 = 1.2x normal pace
+    finally:
+        br.session_fraction = orig
+
+
+def test_retry_once_on_dropped_connection():
+    from bot.smallcap.broker import retry_once
+    calls = []
+
+    @retry_once
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("('Connection aborted.', RemoteDisconnected('Remote end closed connection'))")
+        return "ok"
+    assert flaky() == "ok" and len(calls) == 2
+
+    @retry_once
+    def real_error():
+        raise ValueError("bad symbol")
+    with pytest.raises(ValueError):
+        real_error()
+
+
+def test_orders_are_never_retried():
+    import inspect
+    from bot.smallcap.broker import AlpacaBroker
+    for name in ("limit", "market_sell"):
+        assert not hasattr(getattr(AlpacaBroker, name), "__wrapped__"), f"{name} must not auto-retry"

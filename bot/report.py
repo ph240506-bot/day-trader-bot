@@ -12,36 +12,38 @@ from datetime import datetime, timedelta, timezone
 # ---------------- trades from Alpaca fills ----------------
 def round_trips(fills: list[dict]) -> list[dict]:
     """Pair fills into completed trades (flat -> position -> flat), FIFO, longs and shorts.
-    fills: dicts with symbol, side ('buy'/'sell'/'sell_short'), qty, price, transaction_time."""
+    A plain 'sell' with nothing bought in the window closes a position opened BEFORE the window
+    (e.g. old holdings sold at the open): it is ignored, never mistaken for a new short.
+    Only 'sell_short' opens a short."""
     trades = []
-    book = defaultdict(lambda: {"pos": 0.0, "lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0})
+    book = defaultdict(lambda: {"lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0, "active": False})
     for f in sorted(fills, key=lambda x: x["transaction_time"]):
         sym = f["symbol"].replace("/", "")
-        qty, price = float(f["qty"]), float(f["price"])
-        sign = 1 if f["side"] == "buy" else -1
+        qty, price, side = float(f["qty"]), float(f["price"]), f["side"]
+        sign = 1 if side == "buy" else -1
         b = book[sym]
-        if b["pos"] == 0:
-            b["opened"], b["side"], b["pnl"], b["cost"] = f["transaction_time"], "long" if sign > 0 else "short", 0.0, 0.0
         remaining = qty
-        # close against opposite lots first
-        while remaining > 1e-9 and b["lots"] and (b["lots"][0][1] > 0) != (sign > 0):
+        while remaining > 1e-9 and b["lots"] and (b["lots"][0][1] > 0) != (sign > 0):   # close opposite lots
             lot_qty, lot_sign, lot_price = b["lots"][0]
             take = min(lot_qty, remaining)
             b["pnl"] += (price - lot_price) * take * lot_sign
-            b["pos"] += take * sign
             remaining -= take
             if take >= lot_qty - 1e-9:
                 b["lots"].pop(0)
             else:
                 b["lots"][0][0] = lot_qty - take
-        if remaining > 1e-9:                      # opens or adds to a position
-            b["lots"].append([remaining, sign, price])
-            b["pos"] += remaining * sign
-            b["cost"] += remaining * price
-        if abs(b["pos"]) < 1e-9 and b["opened"] is not None and not b["lots"]:
+        if b["active"] and not b["lots"]:                                               # back to flat
             trades.append({"symbol": sym, "side": b["side"], "pnl": round(b["pnl"], 2), "opened": b["opened"],
                            "closed": f["transaction_time"], "cost": round(b["cost"], 2)})
-            b["pos"], b["opened"] = 0.0, None
+            b["active"] = False
+        if remaining > 1e-9:
+            if side == "sell" and not b["active"]:
+                continue                                     # plain sell, nothing open: pre-window holding
+            if not b["active"]:
+                b.update(active=True, pnl=0.0, cost=0.0, opened=f["transaction_time"],
+                         side="long" if sign > 0 else "short")
+            b["lots"].append([remaining, sign, price])
+            b["cost"] += remaining * price
     return trades
 
 
@@ -67,6 +69,23 @@ def summarize(trades: list[dict]) -> list[str]:
         by_sym[t["symbol"]] += t["pnl"]
     top = sorted(by_sym.items(), key=lambda kv: kv[1])
     lines.append("  By symbol: " + ", ".join(f"{s} {v:+.2f}" for s, v in (top[:3] + top[-3:] if len(top) > 6 else top)))
+    return lines
+
+
+def order_lines(orders, n_fills) -> list[str]:
+    """What actually happened to each order: filled, cancelled, rejected..."""
+    if not orders:
+        return [f"  Orders: none   Fills: {n_fills}"]
+    st = Counter(str(getattr(o.status, "value", o.status)) for o in orders)
+    lines = [f"  Orders: {len(orders)} (" + ", ".join(f"{k} {v}" for k, v in st.most_common()) + f")   Fills: {n_fills}"]
+    for o in orders[:12]:
+        status = str(getattr(o.status, "value", o.status))
+        side = str(getattr(o.side, "value", o.side))
+        typ = str(getattr(o.type, "value", o.type) if getattr(o, "type", None) else getattr(o, "order_type", ""))
+        when = o.submitted_at.strftime("%H:%M") if getattr(o, "submitted_at", None) else "?"
+        px = o.filled_avg_price or o.limit_price or o.stop_price or ""
+        lines.append(f"    {when} UTC {side} {o.symbol} x{o.qty or o.notional} {typ} -> {status}"
+                     + (f" @ {float(px):.2f}" if px else ""))
     return lines
 
 
@@ -123,18 +142,26 @@ def fetch_fills(key, secret, paper, days):
         token = page[-1]["id"]
     acct = client.get_account()
     positions = client.get_all_positions()
-    return rows, acct, positions
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+    try:
+        orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500, nested=False,
+                                                    after=datetime.now(timezone.utc) - timedelta(days=days)))
+    except Exception:
+        orders = []
+    return rows, acct, positions, orders
 
 
 def account_block(title, key, secret, paper, days, journal, kind) -> list[str]:
     lines = [f"=== {title} ==="]
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     try:
-        fills, acct, positions = fetch_fills(key, secret, paper, days)
+        fills, acct, positions, orders = fetch_fills(key, secret, paper, days)
         eq, last = float(acct.equity), float(acct.last_equity)
         lines.append(f"  Account: ${eq:,.2f} (today {eq - last:+,.2f})   Open positions: "
                      + (", ".join(f"{p.symbol} {float(p.unrealized_pl):+.2f}" for p in positions) or "none"))
         lines += summarize(round_trips(fills))
+        lines += order_lines(orders, len(fills))
     except Exception as e:
         lines.append(f"  Couldn't reach Alpaca: {e}")
     lines += journal_lines(journal, since, kind)

@@ -81,7 +81,7 @@ class SCConfig:
     llm_base_url: str = field(default_factory=lambda: _e("LLM_BASE_URL", "http://localhost:3001/v1"))
     llm_api_key: str = field(default_factory=lambda: _e("LLM_API_KEY", ""))
     llm_models: list = field(default_factory=lambda: _e("SC_LLM_MODELS", ["auto:fast", "auto"], list))
-    llm_timeout_sec: float = field(default_factory=lambda: _e("SC_LLM_TIMEOUT_SEC", 4.0, float))
+    llm_timeout_sec: float = field(default_factory=lambda: _e("SC_LLM_TIMEOUT_SEC", 8.0, float))
     llm_required: bool = field(default_factory=lambda: _e("SC_LLM_REQUIRED", True, bool))
 
     dry_run: bool = field(default_factory=lambda: _e("SC_DRY_RUN", False, bool))

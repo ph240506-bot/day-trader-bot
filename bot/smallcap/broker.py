@@ -37,9 +37,34 @@ class Quote:
 
     @property
     def rel_volume(self):
+        """Today's volume vs the pace expected by now from yesterday's full day.
+        At 10:30am only ~1/6 of the session has passed, so 20% of yesterday's volume = 1.2x pace."""
         if self.day_volume and self.prev_volume:
-            return self.day_volume / self.prev_volume
+            return self.day_volume / (self.prev_volume * session_fraction())
         return None
+
+
+def session_fraction(now=None) -> float:
+    """Share of the regular session elapsed (min 0.1 so the first minutes don't explode the ratio)."""
+    now = now or datetime.now(NY)
+    mins = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+    return min(1.0, max(0.1, mins / 390))
+
+
+def retry_once(fn):
+    """Retry a broker call once on a dropped connection (the SHEL error from the first night)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            if not any(w in type(e).__name__ + str(e) for w in ("Connection", "Timeout", "RemoteDisconnected", "reset")):
+                raise
+            time.sleep(0.5)
+            return fn(*a, **kw)
+    return wrapper
 
 
 def round_price(p: float) -> float:
@@ -206,6 +231,7 @@ class AlpacaBroker:
             log.debug("SEC shares %s: %s", symbol, e)
             return None
 
+    @retry_once
     def asset_ok(self, symbol: str) -> bool:
         if symbol not in self._assets:
             try:
@@ -217,15 +243,18 @@ class AlpacaBroker:
         return self._assets[symbol]
 
     # ---- account / clock ----
+    @retry_once
     def account(self):
         a = self.trading.get_account()
         return float(a.equity), float(a.last_equity)
 
+    @retry_once
     def clock(self):
         c = self.trading.get_clock()
         return c.is_open, c.next_open, c.next_close, c.timestamp
 
     # ---- orders ----
+    # no retry: re-sending an order after a dropped connection could place it twice
     def limit(self, symbol, qty, side, price, extended) -> str:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest
@@ -234,12 +263,14 @@ class AlpacaBroker:
             time_in_force=TimeInForce.DAY, limit_price=round_price(price), extended_hours=extended))
         return str(o.id)
 
+    # no retry: re-sending an order after a dropped connection could place it twice
     def market_sell(self, symbol, qty) -> str:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
         return str(self.trading.submit_order(MarketOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)).id)
 
+    @retry_once
     def order(self, order_id):
         o = self.trading.get_order_by_id(order_id)
         status = str(getattr(o.status, "value", o.status)).lower()

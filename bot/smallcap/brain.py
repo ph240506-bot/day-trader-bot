@@ -17,7 +17,8 @@ SYSTEM = (
     "conference appearances, 'exploring', 'intends', letters to shareholders. "
     "Text tagged [Scanner: ...] means the stock is already moving now and this is its latest headline; judge "
     "whether that headline explains the move (an hours-old real catalyst can still be strong). No news = weak. "
-    'Reply with JSON only: {"verdict":"strong"|"weak"|"trap","confidence":0.0-1.0,"reason":"<12 words max>"}'
+    "Do NOT think out loud or explain your steps. "
+    'Reply with one JSON object only: {"verdict":"strong"|"weak"|"trap","confidence":0.0-1.0,"reason":"<12 words max>"}'
 )
 
 
