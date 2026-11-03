@@ -5,6 +5,7 @@ Run on the Pi:   botreport            (last 1 day)
 """
 import csv
 import os
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -56,6 +57,10 @@ def round_trips(fills: list[dict]) -> list[dict]:
     return trades
 
 
+def money(v: float) -> str:
+    return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
+
+
 def summarize(trades: list[dict]) -> list[str]:
     if not trades:
         return ["  No completed trades."]
@@ -74,8 +79,8 @@ def summarize(trades: list[dict]) -> list[str]:
     if fees:
         lines.append(f"  Crypto fees (included above): ${fees:,.2f}")
     best, worst = max(trades, key=lambda t: t["pnl"]), min(trades, key=lambda t: t["pnl"])
-    lines.append(f"  Best: {best['symbol']} {best['side']} +${best['pnl']:,.2f}   "
-                 f"Worst: {worst['symbol']} {worst['side']} ${worst['pnl']:,.2f}")
+    lines.append(f"  Best: {best['symbol']} {best['side']} {money(best['pnl'])}   "
+                 f"Worst: {worst['symbol']} {worst['side']} {money(worst['pnl'])}")
     by_sym = defaultdict(float)
     for t in trades:
         by_sym[t["symbol"]] += t["pnl"]
@@ -110,6 +115,12 @@ def read_csv(path, since):
     return [r for r in rows if r.get("time", "") >= since]
 
 
+def filter_kind(reason: str) -> str:
+    """Group filter reasons by type, so '237820s old' and '237829s old' count together."""
+    r = re.sub(r"[+-]?\d[\d.,]*", "N", reason)
+    return re.sub(r"\(need N%\)|\(max NM\)", "", r).strip()[:40]
+
+
 def journal_lines(path, since, kind) -> list[str]:
     rows = read_csv(path, since)
     if not rows:
@@ -120,13 +131,17 @@ def journal_lines(path, since, kind) -> list[str]:
         scores = Counter(r.get("score", "") for r in rows if r.get("action") == "ordered")
         if scores:
             lines.append("  Orders by score: " + ", ".join(f"{k}/5: {v}" for k, v in sorted(scores.items())))
-        vetoes = [r["llm_reason"] for r in rows if r.get("llm_decision") == "veto"][:5]
-        for v in vetoes:
+        vetoes = [r.get("llm_reason", "") for r in rows if r.get("llm_decision") == "veto"]
+        failed = [v for v in vetoes if v.startswith("LLM skipped")]
+        real = [v for v in vetoes if not v.startswith("LLM skipped")]
+        if vetoes:
+            lines.append(f"  AI vetoes: {len(real)} real, {len(failed)} where the AI gave no usable answer")
+        for v in real[-4:] + failed[-2:]:
             lines.append(f"    veto: {v[:110]}")
     else:
-        reasons = Counter((r.get("reason") or "")[:40] for r in rows if r.get("action") == "filtered")
+        reasons = Counter(filter_kind(r.get("reason") or "") for r in rows if r.get("action") == "filtered")
         if reasons:
-            lines.append("  Top filter reasons: " + "; ".join(f"{k} ({v})" for k, v in reasons.most_common(4)))
+            lines.append("  Top filter reasons: " + "; ".join(f"{k} ({v})" for k, v in reasons.most_common(6)))
         lat = [int(r["latency_ms"]) for r in rows if (r.get("latency_ms") or "").isdigit()]
         if lat:
             lat.sort()

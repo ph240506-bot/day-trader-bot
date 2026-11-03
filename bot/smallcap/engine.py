@@ -254,7 +254,8 @@ class Engine:
             "price": q.price, "change_pct_today": round(q.gap_pct, 1),
             "volume_vs_yesterday": round(q.rel_volume, 2) if q.rel_volume else None,
             "shares_outstanding_millions": base.get("shares_m") or None,
-            "session": sess, "rule_check": f"{rule} ({matched})" if matched else rule})
+            "session": sess, "rule_check": f"{rule} ({matched})" if matched else rule},
+            timeout=cfg.scanner_llm_timeout_sec if ev.source == "scanner" else None)
         ai = verdict["verdict"] if verdict else "none"
         base.update(ai=ai, ai_model=verdict.get("model", "") if verdict else "")
         if verdict and ai == "trap":
@@ -263,7 +264,10 @@ class Engine:
             verdict is None and not cfg.llm_required and rule == "strong")
         latency = int((time.time() - ev.received) * 1000)
         base["latency_ms"] = latency
-        reason = verdict["reason"] if verdict else ("rules only" if go else "AI didn't answer in time")
+        fail = getattr(self.brain, "last_fail", "timeout")
+        reason = verdict["reason"] if verdict else ("rules only" if go else
+                                                    "AI replies unreadable" if fail == "unreadable" else
+                                                    "AI didn't answer in time")
         if not go:
             self.journal(**base, action="pass", reason=reason)
             self.notify.send("veto", f"Pass {sym} {q.gap_pct:+.0f}% (AI: {ai})",

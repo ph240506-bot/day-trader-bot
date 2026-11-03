@@ -69,7 +69,7 @@ class FakeBrain:
     def __init__(self, verdict):
         self.verdict, self.calls = verdict, 0
 
-    async def judge(self, sym, text, ctx):
+    async def judge(self, sym, text, ctx, timeout=None):
         self.calls += 1
         return self.verdict
 
@@ -207,7 +207,7 @@ def test_parallel_events_respect_position_limit(tmp_path):
     from bot.smallcap.main import worker
 
     class SlowBrain(FakeBrain):
-        async def judge(self, *a):
+        async def judge(self, *a, **kw):
             await asyncio.sleep(0.2)
             return STRONG
 
@@ -853,7 +853,7 @@ def test_report_journal_sections(tmp_path):
     e = Engine(cfg(tmp_path), FakeBroker(mover(price=3.1, prev=3.0)), FakeBrain(STRONG), Sink())
     run(e.handle(ev()))
     out = "\n".join(journal_lines(str(tmp_path / "smallcap.csv"), "2000", "smallcap"))
-    assert "filtered 1" in out and "only +3.3%" in out
+    assert "filtered 1" in out and "only N%" in out
 
 
 def test_report_account_block_handles_alpaca_down(tmp_path, monkeypatch):
@@ -960,3 +960,68 @@ def test_report_real_partial_close_not_treated_as_fee():
         {"symbol": "AAPL", "side": "sell", "qty": "5", "price": "101", "transaction_time": "2026-11-03T14:10:00Z"},
     ]
     assert round_trips(fills) == []
+
+
+# ---------------- v8.3 ----------------
+def test_llm_parse_thinking_out_loud_then_answer():
+    """Night 2: a thinking model wrote notes (and echoed the schema) before the real answer."""
+    from bot.llm import parse as main_parse
+    reply = ('The user wants me to act as a cautious reviewer. The format is {"decision": "approve"|"veto", ...}. '
+             'RSI is 62, trend up, no event risk. Final answer:\n{"decision": "veto", "confidence": 0.7, '
+             '"reason": "volume fading"}')
+    assert main_parse(reply)["decision"] == "veto"
+    # the schema echo alone must NOT be read as an approval
+    import pytest
+    with pytest.raises(ValueError):
+        main_parse('The user wants me to reply {"decision": "approve"|"veto", "confidence": 0.0-1.0 and I need to')
+    assert main_parse('```json\n{"decision": "approve", "confidence": 0.8, "reason": "ok')["decision"] == "approve"
+    assert parse('notes {"verdict":"strong"|"weak"|"trap"} then {"verdict":"trap","confidence":0.9,"reason":"ATM"}'
+                 )["verdict"] == "trap"
+
+
+def test_llm_json_mode_falls_back_when_router_rejects_it(monkeypatch):
+    from openai import BadRequestError
+    from bot.config import Config
+    from bot.llm import Reviewer
+    from bot.strategy import Signal
+    from types import SimpleNamespace
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls.append("response_format" in kw)
+            if "response_format" in kw:
+                raise BadRequestError.__new__(BadRequestError)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"decision": "approve", "confidence": 0.8, "reason": "fine"}'))])
+
+    monkeypatch.setenv("LLM_API_KEY", "x")
+    r = Reviewer(Config())
+    r.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    assert r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])["decision"] == "approve"
+    assert r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])["decision"] == "approve"
+    assert calls == [True, False, False]          # tried JSON mode once, then stopped asking
+
+
+def test_brain_says_unreadable_not_timeout(tmp_path):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), RaceLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    RaceLLM.delays, RaceLLM.replies = {}, {"junk": "The user wants me to judge this headline and I"}
+    c = cfg(tmp_path, llm_base_url=f"http://127.0.0.1:{srv.server_port}/v1", llm_api_key="k",
+            llm_models=["junk"], llm_timeout_sec=2.0)
+    b = Brain(c)
+    assert run(b.judge("ABCD", "FDA approval", {})) is None and b.last_fail == "unreadable"
+    RaceLLM.delays, RaceLLM.replies = {"slow": 1.0}, {}
+    c.llm_models = ["slow"]
+    t = time.time()
+    assert run(b.judge("ABCD", "x", {}, timeout=0.3)) is None and b.last_fail == "timeout"
+    assert time.time() - t < 0.9
+    RaceLLM.delays = {}
+    srv.shutdown()
+
+
+def test_report_groups_filter_reasons_and_formats_losses():
+    from bot.report import filter_kind, money
+    assert filter_kind("price data 237820s old") == filter_kind("price data 237829s old")
+    assert filter_kind("only +3.1% (need +8%)") == filter_kind("only +5.0% (need +8%)")
+    assert money(-22.08) == "-$22.08" and money(5) == "+$5.00"
