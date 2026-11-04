@@ -147,7 +147,8 @@ def journal_lines(path, since, kind) -> list[str]:
             lat.sort()
             lines.append(f"  Decision speed: median {lat[len(lat) // 2] / 1000:.1f}s, slowest {lat[-1] / 1000:.1f}s")
         for r in [r for r in rows if r.get("action") in ("pass", "watching", "bought", "sold", "watch-failed", "faded")][-8:]:
-            lines.append(f"    {r.get('action')}: {r.get('symbol')} {r.get('gap_pct') or ''}% "
+            gap = f"{r['gap_pct']}% " if r.get("gap_pct") else ""
+            lines.append(f"    {r.get('action')}: {r.get('symbol')} {gap}"
                          f"AI={r.get('ai') or '-'} | {(r.get('reason') or '')[:80]}")
     return lines
 

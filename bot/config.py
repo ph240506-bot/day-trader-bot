@@ -54,6 +54,8 @@ class Config:
     # Entry windows (stocks only): skip the chaotic open and trades with no time left to work.
     open_delay_min: int = field(default_factory=lambda: _env("OPEN_DELAY_MIN", 10, int))
     no_entry_before_close_min: int = field(default_factory=lambda: _env("NO_ENTRY_BEFORE_CLOSE_MIN", 30, int))
+    # Night 3: TSLA long stopped out, then shorted 8 min later and stopped again. Let the chop settle.
+    reentry_cooldown_min: int = field(default_factory=lambda: _env("REENTRY_COOLDOWN_MIN", 30, int))
     # Trade with the market: longs only when SPY is above its VWAP, shorts only when below.
     market_filter: bool = field(default_factory=lambda: _env("MARKET_FILTER", True, bool))
     # Skip if price moved more than this many ATRs between the signal candle and the order.

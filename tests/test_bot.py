@@ -385,3 +385,43 @@ def test_llm_tries_next_model_when_reply_unreadable(monkeypatch):
     replies["auto"] = "still thinking..."
     out = r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])
     assert out["decision"] == "veto" and "LLM skipped" in out["reason"]
+
+
+def test_cooldown_after_position_closes(monkeypatch, tmp_path):
+    """Night 3: TSLA stopped out, then traded again 8 min later. Now it waits REENTRY_COOLDOWN_MIN."""
+    import time
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("SCAN_MOVERS", "false"); monkeypatch.setenv("TRADE_CRYPTO", "false")
+    orders, held = [], {"AAPL": object()}
+    bars = downtrend_then_breakout()
+    bars = pd.concat([bars, make_bars([105.2]).set_index(bars.index[-1:] + pd.Timedelta("5min"))])
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity="100000", last_equity="100000")
+        def bars(self, syms): return {"AAPL": bars}
+        def positions(self): return dict(held)
+        def has_open_order(self, s): return False
+        def headlines(self, s): return []
+        def enter(self, sym, side, plan): orders.append(sym)
+        def latest_price(self, s): return None
+
+    class FakeReviewer:
+        def __init__(self, cfg): self.client = True
+        def review(self, sig, chart, news): return {"decision": "approve", "confidence": 1, "reason": "ok"}
+
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "Reviewer", FakeReviewer)
+    monkeypatch.setattr(m.Bot, "_in_entry_window", lambda self: True)
+    b = m.Bot(Config())
+    b.notify.send = lambda *a: None
+    b.tick(market_open=True)                 # holding AAPL: nothing to do
+    held.clear(); b.seen.clear()
+    b.tick(market_open=True)                 # AAPL just closed: cooldown, no new order
+    assert orders == [] and "AAPL" in b.last_exit
+    b.last_exit["AAPL"] = time.time() - 31 * 60; b.seen.clear()
+    b.tick(market_open=True)                 # 31 min later: allowed again
+    assert orders == ["AAPL"]

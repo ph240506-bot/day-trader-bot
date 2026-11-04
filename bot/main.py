@@ -37,6 +37,8 @@ class Bot:
         self._last_status = 0.0
         self.mins_to_close = 9999.0     # set by run() from Alpaca's clock (handles early-close days)
         self.seen_day = None
+        self.prev_positions: set[str] = set()
+        self.last_exit: dict[str, float] = {}    # symbol -> when its position closed
         self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         # Crypto stops/targets live here so a restart doesn't leave a position unmanaged.
@@ -102,6 +104,9 @@ class Bot:
             return
         bars = self.mkt.bars(symbols)
         positions = self.mkt.positions()
+        for k in self.prev_positions - set(positions):     # closed since last tick (stop, target or exit)
+            self.last_exit[k] = time.time()
+        self.prev_positions = set(positions)
         self.manage_crypto_exits(bars, positions)
         self.status(symbols, bars, equity, last_equity, positions, market_open)
         stock_entries_ok = market_open and self._in_entry_window()
@@ -139,6 +144,11 @@ class Bot:
                     continue
             pos_key = sym.replace("/", "")
             if pos_key in positions or len(positions) >= self.cfg.max_open_positions:
+                continue
+            since_exit = time.time() - self.last_exit.get(pos_key, 0)
+            if since_exit < self.cfg.reentry_cooldown_min * 60:
+                log.info("Skip %s %s: closed a trade in it %.0f min ago (cooldown %d min)",
+                         sig.side, sym, since_exit / 60, self.cfg.reentry_cooldown_min)
                 continue
             if not self.cfg.dry_run and self.mkt.has_open_order(sym):
                 continue

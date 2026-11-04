@@ -424,6 +424,7 @@ def iso(dt):
 class FakeAlpaca(BaseHTTPRequestHandler):
     """Speaks Alpaca's real JSON wire format, so AlpacaBroker runs its true parsing code."""
     posted = []
+    trade_age = 3
 
     def _send(self, obj, code=200):
         data = json.dumps(obj).encode()
@@ -440,7 +441,7 @@ class FakeAlpaca(BaseHTTPRequestHandler):
                      "o": 3.2, "h": 4.5, "l": 3.1, "c": 4.1, "v": 900000, "n": 5000, "vw": 3.9}
         prev_bar = {"t": iso(now - timedelta(days=1)), "o": 3.0, "h": 3.1, "l": 2.9, "c": 3.0,
                     "v": 300000, "n": 900, "vw": 3.0}
-        snap = {"latestTrade": {"t": iso(now - timedelta(seconds=3)), "x": "V", "p": 4.12, "s": 100, "c": ["@"],
+        snap = {"latestTrade": {"t": iso(now - timedelta(seconds=FakeAlpaca.trade_age)), "x": "V", "p": 4.12, "s": 100, "c": ["@"],
                                 "i": 1, "z": "C"},
                 "latestQuote": {"t": iso(now), "ax": "V", "ap": 4.14, "as": 3, "bx": "V", "bp": 4.10, "bs": 2,
                                 "c": ["R"], "z": "C"},
@@ -528,7 +529,12 @@ def test_real_client_finnhub_and_shares(alpaca):
     broker, c = alpaca
     assert broker.quote("ABCD").price == 4.12                # no Finnhub key: Alpaca price
     c.finnhub_key = "fk"
-    q = broker.quote("ABCD")
+    assert broker.quote("ABCD").source == "alpaca-iex"       # Alpaca price 3s old: Finnhub not needed
+    FakeAlpaca.trade_age = 120                              # IEX hasn't printed for 2 min
+    try:
+        q = broker.quote("ABCD")
+    finally:
+        FakeAlpaca.trade_age = 3
     assert q.price == 4.20 and q.source == "finnhub"
     assert broker.shares_outstanding("ABCD") == 12_500_000   # Finnhub reports millions
     c.finnhub_key, c.edgar_user_agent = "", "test bot me@example.com"
@@ -1025,3 +1031,42 @@ def test_report_groups_filter_reasons_and_formats_losses():
     assert filter_kind("price data 237820s old") == filter_kind("price data 237829s old")
     assert filter_kind("only +3.1% (need +8%)") == filter_kind("only +5.0% (need +8%)")
     assert money(-22.08) == "-$22.08" and money(5) == "+$5.00"
+
+
+# ---------------- v8.4 ----------------
+class ClosingSoonBroker(FakeBroker):
+    mins = 18
+
+    def clock(self):
+        return True, None, datetime.now(timezone.utc) + timedelta(minutes=self.mins), None
+
+
+def test_no_smallcap_buy_late_in_the_day(tmp_path):
+    """Night 3: SNES bought at 15:42, forced out at 15:50. Now: no new buys in the last 30 min."""
+    b = ClosingSoonBroker(mover())
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "skip-late" and not b.placed
+    b2 = ClosingSoonBroker(mover())
+    b2.mins = 120
+    e2 = Engine(cfg(tmp_path / "x"), b2, FakeBrain(STRONG), Sink())
+    assert run(e2.handle(ev())) == "bought"
+
+
+def test_watch_dropped_near_close(tmp_path):
+    from bot.smallcap.engine import Watch
+    b = ClosingSoonBroker(mover())
+    e = Engine(cfg(tmp_path, entry_mode="pullback"), b, FakeBrain(STRONG), Sink())
+    e.watching["ABCD"] = Watch("ABCD", time.time(), 4.5, reason="x", text="x", base={"symbol": "ABCD"})
+    run(e.tick())
+    assert "ABCD" not in e.watching and not b.placed
+
+
+
+def test_premarket_stale_reason_and_looser_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
+    e = Engine(cfg(tmp_path), FakeBroker(mover(age=200_000)), FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "filtered"
+    assert "no pre-market trades yet" in open(e.cfg.journal_path).read()
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
+    e2 = Engine(cfg(tmp_path / "b"), FakeBroker(mover(age=120)), FakeBrain(STRONG), Sink())
+    assert run(e2.handle(ev())) == "bought"          # 2-min-old IEX print at the open is now usable
