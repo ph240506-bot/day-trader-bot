@@ -8,7 +8,7 @@ import json
 import logging
 import re
 
-from openai import APIStatusError, OpenAI, RateLimitError
+from openai import OpenAI
 
 log = logging.getLogger("llm")
 
@@ -27,19 +27,6 @@ class Reviewer:
         self.cfg = cfg
         self.client = OpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "none",
                              timeout=45, max_retries=1) if cfg.llm_api_key else None
-        self.json_mode = True     # ask for JSON-only replies; switched off if the router rejects it
-
-    def _create(self, model, messages):
-        kw = dict(model=model, temperature=0.1, max_tokens=1500, messages=messages)
-        if self.json_mode:
-            try:
-                return self.client.chat.completions.create(response_format={"type": "json_object"}, **kw)
-            except APIStatusError as e:          # any refusal except 'slow down' -> stop using JSON mode
-                if isinstance(e, RateLimitError):
-                    raise
-                log.info("JSON mode not supported (%s); asking without it", str(e)[:80])
-                self.json_mode = False
-        return self.client.chat.completions.create(**kw)
 
     def review(self, signal, chart: dict, headlines: list[str]) -> dict:
         if self.client is None:
@@ -53,8 +40,13 @@ class Reviewer:
         last_err = "no models configured"
         for model in models:                      # first readable answer wins
             try:
-                resp = self._create(model, [{"role": "system", "content": SYSTEM},
-                                            {"role": "user", "content": json.dumps(payload)}])
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    temperature=0.1,
+                    max_tokens=800,   # room for 'thinking' models; normal ones stop after ~40 tokens
+                    messages=[{"role": "system", "content": SYSTEM},
+                              {"role": "user", "content": json.dumps(payload)}],
+                )
                 text = resp.choices[0].message.content or ""
                 out = parse(text)
                 log.info("LLM %s on %s %s (%s): %s", out["decision"], signal.side, signal.symbol, model, out["reason"])
@@ -74,34 +66,18 @@ def _clean(text: str) -> str:
     return text.replace("```json", "").replace("```", "")
 
 
-def last_json(t: str, key: str):
-    """The LAST complete {...} holding `key` (thinking models write notes before the answer)."""
-    for m in reversed(list(re.finditer(r"\{[^{}]*\}", t))):
-        try:
-            d = json.loads(m.group(0))
-        except ValueError:
-            continue
-        if isinstance(d, dict) and key in d:
-            return d
-    try:
-        d = json.loads(t.strip())
-        return d if isinstance(d, dict) and key in d else None
-    except ValueError:
-        return None
-
-
-def last_field(t: str, key: str, values: str):
-    """Last `"key": "value"` in the text, ignoring the model echoing the schema ("approve"|"veto")."""
-    hits = [m for m in re.finditer(rf'"{key}"\s*:\s*"({values})(?!"\s*\|)', t, re.I)]
-    return hits[-1] if hits else None
-
-
 def parse(text: str) -> dict:
-    """Read the AI's verdict, even if the reply is wrapped in code fences, has notes first, or got cut off."""
+    """Read the AI's verdict, even if the reply is wrapped in code fences or got cut off."""
     t = _clean(text)
-    data = last_json(t, "decision")
+    m = re.search(r"\{.*\}", t, re.S)
+    data = None
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            data = None
     if data is None:   # cut-off reply: pull the fields out directly
-        d = last_field(t, "decision", "approve|veto")
+        d = re.search(r'"decision"\s*:\s*"(approve|veto)', t, re.I)
         if not d:
             raise ValueError(f"no verdict in LLM reply: {t.strip()[:80]!r}")
         c = re.search(r'"confidence"\s*:\s*([0-9.]+)', t)

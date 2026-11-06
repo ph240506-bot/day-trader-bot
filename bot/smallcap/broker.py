@@ -67,18 +67,6 @@ def retry_once(fn):
     return wrapper
 
 
-def bigger_pool(client, size=32):
-    """alpaca-py keeps 10 connections; the small-cap bot runs up to 32 checks at once."""
-    try:
-        from requests.adapters import HTTPAdapter
-        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=size)
-        client._session.mount("https://", adapter)
-        client._session.mount("http://", adapter)
-    except Exception as e:      # private attribute: never let this stop the bot
-        log.debug("pool resize skipped: %s", e)
-    return client
-
-
 def round_price(p: float) -> float:
     return round(p, 2) if p >= 1 else round(p, 4)
 
@@ -124,9 +112,8 @@ class AlpacaBroker:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.trading.client import TradingClient
         self.cfg = cfg
-        self.trading = bigger_pool(TradingClient(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.paper,
-                                                 url_override=trading_url))
-        self.data = bigger_pool(StockHistoricalDataClient(cfg.alpaca_key, cfg.alpaca_secret, url_override=data_url))
+        self.trading = TradingClient(cfg.alpaca_key, cfg.alpaca_secret, paper=cfg.paper, url_override=trading_url)
+        self.data = StockHistoricalDataClient(cfg.alpaca_key, cfg.alpaca_secret, url_override=data_url)
         self._assets: dict[str, bool] = {}
         self._shares: dict[str, float | None] = {}
         self._cik: dict[str, int] | None = None
@@ -164,9 +151,6 @@ class AlpacaBroker:
                 except Exception as e2:
                     log.debug("snapshot %s failed: %s", s, e2)
         for s in finnhub_for:
-            have = out.get(s)
-            if have and have.age_sec is not None and have.age_sec <= 20:
-                continue              # Alpaca's price is fresh: save the Finnhub budget for stocks that need it
             fh = self._finnhub(s)
             if fh:
                 q = out.get(s) or Quote(0, 0, 0, 0, None, None)

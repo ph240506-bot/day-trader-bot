@@ -4,9 +4,7 @@ import json
 import logging
 import re
 
-from openai import APIStatusError, AsyncOpenAI, RateLimitError
-
-from ..llm import last_field, last_json
+from openai import AsyncOpenAI
 
 log = logging.getLogger("brain")
 
@@ -26,9 +24,15 @@ SYSTEM = (
 
 def parse(text: str) -> dict:
     t = re.sub(r"<think>.*?(</think>|$)", "", text or "", flags=re.S | re.I).replace("```json", "").replace("```", "")
-    d = last_json(t, "verdict")
+    m = re.search(r"\{.*\}", t, re.S)
+    d = None
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except ValueError:
+            d = None
     if d is None:
-        v = last_field(t, "verdict", "strong|weak|trap")
+        v = re.search(r'"verdict"\s*:\s*"(strong|weak|trap)', t, re.I)
         if not v:
             raise ValueError("no verdict")
         c = re.search(r'"confidence"\s*:\s*([0-9.]+)', t)
@@ -49,46 +53,29 @@ class Brain:
         self.cfg = cfg
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "none",
                                   timeout=cfg.llm_timeout_sec, max_retries=0) if cfg.llm_api_key else None
-        self.json_mode = True
-        self.last_fail = ""       # "timeout" or "unreadable" after judge() returns None
 
-    async def _ask(self, model: str, payload: str, timeout: float) -> dict:
-        kw = dict(model=model, temperature=0, max_tokens=600, timeout=timeout + 1,   # the race below enforces the real limit
-                  messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": payload}])
-        r = None
-        if self.json_mode:
-            try:
-                r = await self.client.chat.completions.create(response_format={"type": "json_object"}, **kw)
-            except APIStatusError as e:
-                if isinstance(e, RateLimitError):
-                    raise
-                self.json_mode = False
-        if r is None:
-            r = await self.client.chat.completions.create(**kw)
+    async def _ask(self, model: str, payload: str) -> dict:
+        r = await self.client.chat.completions.create(
+            model=model, temperature=0, max_tokens=400,
+            messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": payload}])
         out = parse(r.choices[0].message.content)
         out["model"] = model
         return out
 
-    async def judge(self, symbol: str, text: str, context: dict, timeout: float | None = None) -> dict | None:
-        """Returns the first valid verdict, or None (self.last_fail says whether it timed out or was unreadable)."""
-        self.last_fail = "no AI key"
+    async def judge(self, symbol: str, text: str, context: dict) -> dict | None:
+        """Returns the first valid verdict, or None if nobody answered in time."""
         if not self.client:
             return None
-        timeout = timeout or self.cfg.llm_timeout_sec
         payload = json.dumps({"symbol": symbol, "text": text, "market": context})
-        tasks = [asyncio.create_task(self._ask(m, payload, timeout)) for m in self.cfg.llm_models]
-        self.last_fail = "unreadable"
+        tasks = [asyncio.create_task(self._ask(m, payload)) for m in self.cfg.llm_models]
         try:
-            for fut in asyncio.as_completed(tasks, timeout=timeout):
+            for fut in asyncio.as_completed(tasks, timeout=self.cfg.llm_timeout_sec):
                 try:
                     return await fut
-                except asyncio.TimeoutError:      # Python 3.11+ raises the race timeout here
-                    raise
                 except Exception as e:
-                    log.info("AI model failed for %s: %s %s", symbol, type(e).__name__, str(e)[:100])
+                    log.debug("model failed: %s", e)
         except asyncio.TimeoutError:
-            self.last_fail = "timeout"
-            log.info("AI timed out after %.1fs for %s", timeout, symbol)
+            log.info("AI timed out after %.1fs for %s", self.cfg.llm_timeout_sec, symbol)
         finally:
             for t in tasks:
                 t.cancel()
