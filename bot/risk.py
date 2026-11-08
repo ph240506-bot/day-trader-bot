@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class OrderPlan:
     qty: float
     stop: float
-    target: float
+    target: float | None      # None = no profit target, hold until the bot flattens at the close
 
 
 def plan_order(side: str, price: float, atr: float, equity: float, cfg, fractional: bool) -> OrderPlan | None:
@@ -33,3 +33,22 @@ def daily_loss_hit(equity: float, last_equity: float, cfg) -> bool:
     if last_equity <= 0:
         return False
     return (equity - last_equity) / last_equity * 100 <= -cfg.daily_loss_limit_pct
+
+
+def plan_orb(side: str, price: float, o: dict, equity: float, cfg) -> OrderPlan | None:
+    """Opening-range breakout sizing: fixed % of the account at risk, stop from orb.stop_distance,
+    position capped at max_position_pct (no leverage), optional target in R."""
+    from .orb import stop_distance
+    if price <= 0 or equity <= 0:
+        return None
+    dist = stop_distance(price, o, cfg)
+    if dist <= 0:
+        return None
+    qty = min(equity * cfg.risk_per_trade_pct / 100 / dist, equity * cfg.max_position_pct / 100 / price)
+    qty = math.floor(qty)
+    if qty <= 0:
+        return None
+    sign = 1 if side == "buy" else -1
+    stop = round(price - sign * dist, 2)
+    target = round(price + sign * cfg.orb_target_r * dist, 2) if cfg.orb_target_r > 0 else None
+    return OrderPlan(qty, stop, target)

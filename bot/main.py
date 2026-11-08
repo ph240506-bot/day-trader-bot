@@ -10,11 +10,12 @@ from zoneinfo import ZoneInfo
 from .config import Config
 from .llm import Reviewer
 from .market import Market, is_crypto
-from .risk import daily_loss_hit, plan_order
+from .risk import daily_loss_hit, plan_orb, plan_order
 from .notify import Notifier
-from .scanner import MoverScanner
+from .scanner import InPlayScanner, MoverScanner
 from .indicators import add_all
-from .strategy import chart_summary, evaluate
+from .orb import breakout_side
+from .strategy import Signal, chart_summary, evaluate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -39,7 +40,13 @@ class Bot:
         self.seen_day = None
         self.prev_positions: set[str] = set()
         self.last_exit: dict[str, float] = {}    # symbol -> when its position closed
-        self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
+        self.scanner = MoverScanner(cfg, self.mkt.trading) if (cfg.scan_movers and cfg.strategy != "orb") else None
+        # ORB: today's stocks in play and their opening ranges, built once the range has closed
+        self.in_play = InPlayScanner(cfg, self.mkt) if cfg.strategy == "orb" else None
+        self.orb_day = None                      # date the list below belongs to
+        self.orb_list: list[tuple[str, dict]] = []
+        self.orb_tries = 0
+        self.orb_done: set[str] = set()          # symbols already traded today (one ORB trade per stock per day)
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         # Crypto stops/targets live here so a restart doesn't leave a position unmanaged.
         self.state_path = os.path.join(os.path.dirname(cfg.journal_path) or ".", "crypto_exits.json")
@@ -94,19 +101,25 @@ class Bot:
         if self.halted:
             return
 
-        stocks = list(self.cfg.stocks)
+        positions = self.mkt.positions()
+        if self.cfg.strategy == "orb" and market_open:
+            try:
+                self.orb_tick(equity, positions)
+            except Exception as e:
+                log.exception("ORB step failed: %s", e)
+        stocks = list(self.cfg.stocks) if self.cfg.strategy != "orb" else []
         movers = []
         if market_open and self.scanner:
             movers = [m for m in self.scanner.refresh() if m not in stocks]
             stocks += movers
         symbols = (stocks if market_open else []) + (self.cfg.cryptos if self.cfg.trade_crypto else [])
-        if not symbols:
-            return
-        bars = self.mkt.bars(symbols)
-        positions = self.mkt.positions()
         for k in self.prev_positions - set(positions):     # closed since last tick (stop, target or exit)
             self.last_exit[k] = time.time()
         self.prev_positions = set(positions)
+        if not symbols:                                     # ORB mode with crypto off: nothing else to scan
+            self.status([], {}, equity, last_equity, positions, market_open)
+            return
+        bars = self.mkt.bars(symbols)
         self.manage_crypto_exits(bars, positions)
         self.status(symbols, bars, equity, last_equity, positions, market_open)
         stock_entries_ok = market_open and self._in_entry_window()
@@ -200,6 +213,87 @@ class Bot:
                     self.notify.send("alert", f"Order failed: {sym}", str(e)[:300], 4, "warning")
             self.journal(row)
 
+    # ---------- opening range breakout ----------
+    def _orb_window(self):
+        """(range_closed, entries_allowed): the range has closed; we're still inside the entry window."""
+        now = datetime.now(NY)
+        mins = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        return mins >= self.cfg.orb_minutes + 0.3, self.cfg.orb_minutes <= mins <= self.cfg.orb_entry_window_min
+
+    def orb_tick(self, equity, positions):
+        today = datetime.now(NY).date()
+        if self.orb_day != today:
+            self.orb_day, self.orb_list, self.orb_tries, self.orb_done = today, [], 0, set()
+        range_closed, entries_ok = self._orb_window()
+        if not range_closed or not entries_ok:
+            return
+        if not self.orb_list and self.orb_tries < 5:          # build the list (retry a few times if the data lags)
+            self.orb_tries += 1
+            self.orb_list = self.in_play.pick(today)
+            if self.orb_list:
+                self.notify.send("near_miss", f"Stocks in play ({len(self.orb_list)})",
+                                 ", ".join(f"{s} {o['rel_volume']:.1f}x" for s, o in self.orb_list[:12]), 2, "mag")
+        pending = [s for s, _ in self.orb_list if s not in self.orb_done and s not in positions]
+        prices = self.mkt.latest_prices(pending) if pending else {}
+        for sym, o in self.orb_list:
+            if sym in self.orb_done or sym in positions or len(positions) >= self.cfg.max_open_positions:
+                continue
+            px = prices.get(sym)
+            if not px:
+                continue
+            side = breakout_side(o, px, allow_short=sym in self.in_play.shortable)
+            if side is None:
+                continue
+            # don't chase: the break must be fresh (within one stop-distance of the range edge)
+            edge = o["high"] if side == "buy" else o["low"]
+            plan = plan_orb(side, px, o, equity, self.cfg)
+            if not plan:
+                self.orb_done.add(sym)
+                continue
+            dist = abs(px - plan.stop)
+            if abs(px - edge) > dist:
+                log.info("ORB %s %s: already %.2f past the range (stop is %.2f): too late", side, sym, abs(px - edge), dist)
+                self.orb_done.add(sym)
+                continue
+            if not self.cfg.dry_run and self.mkt.has_open_order(sym):
+                continue
+            sig = Signal(sym, side, 5, px, o["atr_d"],
+                         [f"ORB {self.cfg.orb_minutes}m breakout", f"relative volume {o['rel_volume']:.1f}x",
+                          f"range {o['low']:.2f}-{o['high']:.2f}"])
+            if self.cfg.orb_llm:
+                chart = {"opening_range": {k: round(v, 4) if isinstance(v, float) else v for k, v in o.items()},
+                         "price_now": px, "setup": "opening range breakout on a stock in play"}
+                verdict = self.reviewer.review(sig, chart, self.mkt.headlines(sym))
+            else:
+                verdict = {"decision": "approve", "confidence": 1.0, "reason": "AI check off for ORB"}
+            self.orb_done.add(sym)                     # one attempt per stock per day, whatever happens next
+            row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym, "side": side,
+                   "score": 5, "price": px, "qty": plan.qty, "stop": plan.stop, "target": plan.target or "",
+                   "llm_decision": verdict["decision"], "llm_reason": verdict["reason"], "reasons": "; ".join(sig.reasons)}
+            if verdict["decision"] != "approve":
+                row["action"] = "skipped"
+                self.notify.send("veto", f"AI veto: ORB {side} {sym}", f"${px:,.2f}. {verdict['reason']}", 3, "no_entry")
+            elif self.cfg.dry_run:
+                row["action"] = "dry-run"
+            else:
+                try:
+                    cap = px * (1 + 0.002) if side == "buy" else px * (1 - 0.002)    # limit: at most 0.2% worse
+                    self.mkt.enter(sym, side, plan, limit_price=cap)
+                    row["action"] = "ordered"
+                    positions[sym] = True
+                    log.info("ORB ORDER %s %s x%s @<=%.2f stop %.2f target %s", side, sym, plan.qty, cap, plan.stop,
+                             plan.target or "close")
+                    self.notify.send("trade", f"{'BUY' if side == 'buy' else 'SHORT'} {sym} x{plan.qty} (ORB)",
+                                     f"Breakout ~${px:,.2f} (${plan.qty * px:,.0f}) | Stop ${plan.stop:,.2f} | "
+                                     f"Target {('$%.2f' % plan.target) if plan.target else 'hold to the close'}\n"
+                                     f"Relative volume {o['rel_volume']:.1f}x. AI: {verdict['reason']}", 4,
+                                     "chart_with_upwards_trend" if side == "buy" else "chart_with_downwards_trend")
+                except Exception as e:
+                    row["action"] = f"error: {e}"[:200]
+                    log.error("ORB order failed for %s: %s", sym, e)
+                    self.notify.send("alert", f"Order failed: {sym}", str(e)[:300], 4, "warning")
+            self.journal(row)
+
     def _in_entry_window(self) -> bool:
         now = datetime.now(NY)
         mins_since_open = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
@@ -223,7 +317,8 @@ class Bot:
         day_pl = equity - last_equity
         prices = ", ".join(f"{s} {float(bars[s]['close'].iloc[-1]):,.2f}" for s in list(bars)[:6])
         log.info("Status: %s | watching %d symbols (%s%s) | equity $%s (today %+.2f) | %d open position(s)%s",
-                 "stocks+crypto" if market_open else "crypto only (stock market closed)",
+                 ("ORB on %d stocks in play + " % len(self.orb_list) if self.cfg.strategy == "orb" else "") +
+                 ("stocks+crypto" if market_open else "crypto only (stock market closed)"),
                  len(symbols), prices, ", ..." if len(bars) > 6 else "",
                  f"{equity:,.2f}", day_pl, len(positions),
                  ": " + ", ".join(positions) if positions else "")
@@ -294,7 +389,8 @@ class Bot:
                 self.tick(market_open=stocks_live)
             except Exception as e:
                 log.exception("tick failed: %s", e)
-            time.sleep(self.cfg.loop_seconds)
+            fast = self.cfg.strategy == "orb" and stocks_live and self._orb_window()[1]
+            time.sleep(self.cfg.orb_poll_seconds if fast else self.cfg.loop_seconds)
 
         # Crypto is only watched while the bot runs, so never leave it unattended.
         if self.crypto_exits and not self.cfg.dry_run:

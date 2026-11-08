@@ -6,8 +6,9 @@ burns day traders: penny stocks, warrants/units, and anything Alpaca won't let y
 import logging
 import time
 
+from alpaca.data.enums import MostActivesBy
 from alpaca.data.historical.screener import ScreenerClient
-from alpaca.data.requests import MarketMoversRequest
+from alpaca.data.requests import MarketMoversRequest, MostActivesRequest
 
 log = logging.getLogger("scanner")
 
@@ -68,3 +69,65 @@ def pick_movers(raw, cfg, get_asset) -> list:
         if len(keep) >= cfg.top_movers:
             break
     return keep
+
+
+class InPlayScanner:
+    """Builds the morning's candidate pool (most active + biggest movers), then ranks it by opening
+    relative volume using the shared ORB code. Call pick() once the opening range has closed."""
+
+    def __init__(self, cfg, market):
+        self.cfg, self.mkt = cfg, market
+        self.screener = ScreenerClient(cfg.alpaca_key, cfg.alpaca_secret)
+        self.shortable: set[str] = set()
+        self._asset_cache: dict[str, object] = {}
+
+    def candidates(self) -> list[str]:
+        pool = []
+        try:
+            for by in (MostActivesBy.VOLUME, MostActivesBy.TRADES):
+                pool += [a.symbol for a in self.screener.get_most_actives(MostActivesRequest(top=100, by=by)).most_actives]
+        except Exception as e:
+            log.warning("most-actives scan failed: %s", e)
+        try:
+            mv = self.screener.get_market_movers(MarketMoversRequest(top=50))
+            pool += [m.symbol for m in list(mv.gainers) + list(mv.losers)]
+        except Exception as e:
+            log.warning("movers scan failed: %s", e)
+        out = []
+        for sym in dict.fromkeys(pool):
+            if not (sym.isalpha() and len(sym) <= 5):
+                continue
+            a = self._asset(sym)
+            if a is None or not getattr(a, "tradable", False):
+                continue
+            out.append(sym)
+            if getattr(a, "easy_to_borrow", False) and getattr(a, "shortable", False):
+                self.shortable.add(sym)
+            if len(out) >= self.cfg.orb_candidates:
+                break
+        return out
+
+    def pick(self, today) -> list[tuple[str, dict]]:
+        """Today's stocks in play: [(symbol, opening-range dict)], highest relative volume first."""
+        from .orb import opening_ranges, pick_in_play
+        syms = self.candidates()
+        if not syms:
+            return []
+        frames = self.mkt.bars(syms, days=25)
+        today_ranges = {}
+        for sym, df in frames.items():
+            r = opening_ranges(df, self.cfg.orb_minutes, self.cfg.bar_minutes)
+            if today in r and r[today]["nbars"] >= r[today]["expected_bars"]:
+                today_ranges[sym] = r[today]
+        picks = pick_in_play(today_ranges, self.cfg)
+        log.info("Stocks in play (%d of %d candidates): %s", len(picks), len(syms),
+                 ", ".join(f"{s} {o['rel_volume']:.1f}x" for s, o in picks) or "none")
+        return picks
+
+    def _asset(self, symbol):
+        if symbol not in self._asset_cache:
+            try:
+                self._asset_cache[symbol] = self.mkt.trading.get_asset(symbol)
+            except Exception:
+                self._asset_cache[symbol] = None
+        return self._asset_cache[symbol]

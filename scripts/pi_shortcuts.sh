@@ -11,8 +11,8 @@ alias boterrors='cd $BOTDIR && docker compose logs --since 24h bot smallcap 2>/d
 alias bottemp='watch -n 2 vcgencmd measure_temp'
 
 # --- control ---
-alias botrestart='cd $BOTDIR && docker compose restart bot'
-alias screstart='cd $BOTDIR && docker compose restart smallcap'
+alias botrestart='cd $BOTDIR && docker compose up -d --force-recreate bot'   # re-reads .env
+alias screstart='cd $BOTDIR && docker compose up -d --force-recreate smallcap'   # re-reads .env
 alias botupdate='cd $BOTDIR && git pull && docker compose up -d --build && echo && echo "Now running version $(cat VERSION 2>/dev/null || echo unknown)"'
 alias botversion='cat $BOTDIR/VERSION 2>/dev/null || echo unknown'
 botreport() { cd $BOTDIR && docker compose exec -T -e DAYS="${DAYS:-1}" bot python -m bot.report; }
@@ -48,7 +48,7 @@ bottemp     live temperature (Ctrl+C to stop)
 botrestart  restart main bot         screstart  restart small-cap bot
 botupdate   install an update (after pushing from your Mac)
 botreport   performance report (DAYS=30 botreport for a month) - paste it to Claude
-  botbacktest replay the main bot's rules over 90 days to compare settings (DAYS=180 botbacktest)
+  botbacktest compare ORB vs EMA on 90 days of real data, net of costs (~10 min; DAYS=180 botbacktest)
 botexport   export all fills from Alpaca (for the monthly review)
 botpanic    EMERGENCY: stop both bots + close every position
 botresume   start the bots again after botpanic

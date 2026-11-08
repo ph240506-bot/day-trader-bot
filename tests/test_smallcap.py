@@ -515,7 +515,9 @@ def alpaca(tmp_path):
     srv.shutdown()
 
 
-def test_real_client_quotes_and_vwap(alpaca):
+def test_real_client_quotes_and_vwap(alpaca, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 1.0)   # as if at the close, any time of day
     broker, c = alpaca
     qs = broker.quotes(["ABCD", "NODATA"])
     q = qs["ABCD"]

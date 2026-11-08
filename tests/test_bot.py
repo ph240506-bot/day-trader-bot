@@ -129,7 +129,7 @@ def test_full_tick_with_fake_broker(monkeypatch, tmp_path):
     import bot.main as m
 
     monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
-    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv")); monkeypatch.setenv("STRATEGY", "ema")
     cfg = Config()
     orders = []
     bars = downtrend_then_breakout()
@@ -247,6 +247,7 @@ def test_loss_limit_resets_next_day(monkeypatch, tmp_path):
         equity = "97000"
         def __init__(self, cfg): pass
         def account(self): return SimpleNamespace(equity=FakeMarket.equity, last_equity="100000")
+        def positions(self): return {}
         def flatten_all(self): pass
     monkeypatch.setattr(m, "Market", FakeMarket)
     monkeypatch.setattr(m, "MoverScanner", lambda cfg, t: None)
@@ -392,7 +393,7 @@ def test_cooldown_after_position_closes(monkeypatch, tmp_path):
     import time
     import bot.main as m
     monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
-    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv")); monkeypatch.setenv("STRATEGY", "ema")
     monkeypatch.setenv("SCAN_MOVERS", "false"); monkeypatch.setenv("TRADE_CRYPTO", "false")
     orders, held = [], {"AAPL": object()}
     bars = downtrend_then_breakout()
@@ -434,50 +435,6 @@ def _day_bars(day, prices, start="09:30"):
     return pd.DataFrame({"open": p, "high": p + 0.2, "low": p - 0.2, "close": p, "volume": 1000.0}, index=idx)
 
 
-def test_backtest_simulate_stop_target_and_flatten():
-    from bot.backtest import Setup, simulate
-    df = _day_bars("2026-11-02", [100, 100, 101, 102, 103, 104, 105, 106])
-    # long, ATR 1, stop 1 ATR, target 2R: enters at 100 (bar 1 open), target 102 hit on bar 3
-    r = simulate([Setup("X", "buy", 4, 0, 1.0)], df, 1.0, 2.0, 3, False, 30)
-    assert len(r) == 1 and r[0]["r"] == pytest.approx(2.0)
-    # short, same data: stop at 101 hit on bar 2 -> -1R
-    r = simulate([Setup("X", "sell", 4, 0, 1.0)], df, 1.0, 2.0, 3, False, 30)
-    assert r[0]["r"] == pytest.approx(-1.0)
-    # bar that touches both: count the stop (worst case)
-    both = df.copy(); both.iloc[2, both.columns.get_loc("high")] = 110; both.iloc[2, both.columns.get_loc("low")] = 90
-    assert simulate([Setup("X", "buy", 4, 0, 1.0)], both, 1.0, 2.0, 3, False, 30)[0]["r"] == pytest.approx(-1.0)
-    # filters: score too low / shorts excluded
-    assert simulate([Setup("X", "buy", 3, 0, 1.0)], df, 1.0, 2.0, 4, False, 30) == []
-    assert simulate([Setup("X", "sell", 4, 0, 1.0)], df, 1.0, 2.0, 3, True, 30) == []
-    # neither hit before 15:50 -> closed at the flatten bar's open
-    late = _day_bars("2026-11-02", [100] * 6, start="15:25")
-    r = simulate([Setup("X", "buy", 4, 0, 5.0)], late, 1.0, 2.0, 3, False, 30)
-    assert r[0]["r"] == pytest.approx(0.0) and r[0]["time"].strftime("%H:%M") == "15:30"
-
-
-def test_backtest_end_to_end_on_random_walk():
-    from bot.backtest import find_setups, grid, report
-    rng = np.random.default_rng(1)
-    frames = {}
-    for sym in ("AAA", "SPY"):
-        days = []
-        for d in pd.bdate_range("2026-08-03", periods=40):
-            p = 100 + np.cumsum(rng.normal(0, 0.3, 78))
-            days.append(_day_bars(d.date(), p))
-        df = pd.concat(days)
-        df["high"], df["low"] = df[["open", "close"]].max(axis=1) + 0.1, df[["open", "close"]].min(axis=1) - 0.1
-        df["volume"] = rng.integers(500, 5000, len(df)).astype(float)
-        frames[sym] = df
-    cfg = Config()
-    setups = {s: find_setups(s, frames[s], frames["SPY"], cfg) for s in frames}
-    assert setups["AAA"] and all(st.i + 1 < len(frames["AAA"]) for st in setups["AAA"])
-    for st in setups["AAA"]:      # never in the first 10 min or last 30 min
-        t = frames["AAA"].index[st.i] + pd.Timedelta("5min")
-        assert t.strftime("%H:%M") >= "09:40" and t.strftime("%H:%M") <= "15:30"
-    text = "\n".join(report(grid(setups, frames, cfg), cfg, 40, 2))
-    assert "Your current settings" in text and "Best 8" in text
-
-
 def test_flatten_retries_until_flat_and_reports_leftovers(monkeypatch):
     """6 Nov: AAPL stayed open after the close because the close was refused while its legs cancelled."""
     import time
@@ -499,3 +456,175 @@ def test_flatten_retries_until_flat_and_reports_leftovers(monkeypatch):
     held[:] = [["AAPL"]] * 5
     FakeTrading.calls = 0
     assert m.flatten_all(tries=2) == ["AAPL"] and FakeTrading.calls == 2
+
+
+# ---------------- v9: opening range breakout on stocks in play ----------------
+def _orb_history(days=20, open_vol=1000.0, today_open_vol=None, up=True, seed=0):
+    """5-min regular-session bars for `days` days; today's first candle is bullish (or bearish)."""
+    rng = np.random.default_rng(seed)
+    frames = []
+    dates = pd.bdate_range(end="2026-11-06", periods=days)
+    for k, d in enumerate(dates):
+        idx = pd.date_range(f"{d.date()} 09:30", periods=78, freq="5min", tz="America/New_York")
+        p = 50 + np.cumsum(rng.normal(0, 0.05, 78))
+        df = pd.DataFrame({"open": p, "high": p + 0.1, "low": p - 0.1, "close": p + 0.02, "volume": 500.0}, index=idx)
+        df.iloc[0, df.columns.get_loc("volume")] = (today_open_vol if (k == days - 1 and today_open_vol) else open_vol)
+        if k == days - 1:    # today's opening candle: 50.00 -> 50.40 (bull) or 50.40 -> 50.00 (bear), high 50.5 low 49.9
+            df.iloc[0, [df.columns.get_loc(c) for c in ("open", "high", "low", "close")]] = (
+                [50.0, 50.5, 49.9, 50.4] if up else [50.4, 50.5, 49.9, 50.0])
+        frames.append(df)
+    return pd.concat(frames)
+
+
+def test_opening_ranges_use_only_past_data():
+    from bot.orb import opening_ranges
+    df = _orb_history(today_open_vol=5000.0)
+    r = opening_ranges(df, 5, 5)
+    today = df.index[-1].date()
+    o = r[today]
+    assert (o["high"], o["low"], o["open"], o["close"]) == (50.5, 49.9, 50.0, 50.4)
+    assert o["rel_volume"] == pytest.approx(5.0)              # 5000 vs a typical 1000
+    assert 0 < o["atr_d"] < 2                                  # daily ATR from past days, in dollars
+    assert df.index[0].date() not in r                         # no history yet on day 1 -> no range
+
+
+def test_pick_in_play_filters_and_ranks():
+    from bot.orb import pick_in_play
+    cfg = Config()
+    cands = {"HOT": {"close": 20, "atr_d": 1.0, "rel_volume": 6.0, "high": 20.5, "low": 19.5},
+             "WARM": {"close": 20, "atr_d": 1.0, "rel_volume": 2.0, "high": 20.5, "low": 19.5},
+             "QUIET": {"close": 20, "atr_d": 1.0, "rel_volume": 0.5, "high": 20.5, "low": 19.5},   # not in play
+             "PENNY": {"close": 2, "atr_d": 1.0, "rel_volume": 9.0, "high": 2.1, "low": 1.9},      # < min price
+             "FLAT": {"close": 20, "atr_d": 0.1, "rel_volume": 9.0, "high": 20.5, "low": 19.5}}    # ATR too small
+    assert [s for s, _ in pick_in_play(cands, cfg)] == ["HOT", "WARM"]
+    cfg.orb_top_n = 1
+    assert [s for s, _ in pick_in_play(cands, cfg)] == ["HOT"]
+
+
+def test_stop_distance_floors_and_breakout_side():
+    from bot.orb import breakout_side, stop_distance
+    cfg = Config()
+    o = {"high": 50.5, "low": 49.9, "open": 50.0, "close": 50.4, "atr_d": 2.0}
+    assert stop_distance(50.5, o, cfg) == pytest.approx(0.2)                 # 10% of a $2 ATR
+    o_small = {**o, "atr_d": 0.6}
+    assert stop_distance(50.5, o_small, cfg) == pytest.approx(50.5 * 0.003)  # floor: 0.3% of price, not $0.06
+    cfg.orb_stop_mode = "range"
+    assert stop_distance(50.5, o, cfg) == pytest.approx(0.6)                 # whole range when wider
+    assert breakout_side(o, 50.51) == "buy" and breakout_side(o, 50.49) is None and breakout_side(o, 49.0) is None
+    bear = {**o, "open": 50.4, "close": 50.0}
+    assert breakout_side(bear, 49.89) == "sell" and breakout_side(bear, 49.89, allow_short=False) is None
+
+
+def test_backtest_orb_day_win_loss_and_costs():
+    from bot.backtest import simulate_orb_day
+    cfg = Config()
+    o = {"high": 50.5, "low": 49.9, "open": 50.0, "close": 50.4, "atr_d": 2.0}
+    idx = pd.date_range("2026-11-06 09:30", periods=78, freq="5min", tz="America/New_York")
+    base = pd.DataFrame({"open": 50.4, "high": 50.45, "low": 50.35, "close": 50.4, "volume": 100.0}, index=idx)
+    # bar 2 (09:40) breaks 50.5, then price climbs to 53 and stays: hold-to-close winner
+    win = base.copy()
+    win.iloc[2, [1, 3]] = [50.6, 50.55]
+    win.iloc[3:, 0:4] = [53.0, 53.1, 52.9, 53.0]
+    t = simulate_orb_day("X", win, o, cfg, cost=0.0, stop_frac=0.10, stop_mode="atr", target_r=0, window_min=60, minutes=5)
+    assert t.side == "buy" and t.entry == 50.5 and t.dist == pytest.approx(0.2)
+    assert t.r == pytest.approx((53.0 - 50.5) / 0.2)                         # exits at the 15:55 bar open
+    # same, with a 3R target: capped at +3R
+    t3 = simulate_orb_day("X", win, o, cfg, 0.0, 0.10, "atr", 3, 60, 5)
+    assert t3.r == pytest.approx(3.0)
+    # breakout then an immediate reversal through the stop on the next bar: -1R, worse with costs
+    loss = base.copy()
+    loss.iloc[2, [1, 3]] = [50.6, 50.55]
+    loss.iloc[3, 0:4] = [50.5, 50.5, 49.0, 49.2]
+    t = simulate_orb_day("X", loss, o, cfg, 0.0, 0.10, "atr", 0, 60, 5)
+    assert t.r == pytest.approx(-1.0)
+    tc = simulate_orb_day("X", loss, o, cfg, 0.05, 0.10, "atr", 0, 60, 5)
+    assert tc.r < -1.1                                                       # 0.1% round trip on a 0.4% stop hurts
+    # no breakout inside the entry window -> no trade
+    assert simulate_orb_day("X", base, o, cfg, 0.0, 0.10, "atr", 0, 60, 5) is None
+    late = base.copy()
+    late.iloc[20, [1, 3]] = [50.6, 50.55]                                    # 11:10, after the 60-min window
+    assert simulate_orb_day("X", late, o, cfg, 0.0, 0.10, "atr", 0, 60, 5) is None
+
+
+def test_backtest_report_runs_end_to_end():
+    from bot.backtest import report
+    frames = {"HOT": _orb_history(today_open_vol=5000.0, seed=1), "SPY": _orb_history(seed=2)}
+    cfg = Config()
+    text = "\n".join(report(frames, cfg, 30, 0.05))
+    assert "ORB on stocks in play" in text and "Original EMA-cross" in text and "Robust" in text
+
+
+def test_live_orb_tick_enters_once_with_limit_cap(monkeypatch, tmp_path):
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("STRATEGY", "orb"); monkeypatch.setenv("TRADE_CRYPTO", "false")
+    monkeypatch.setenv("ORB_LLM", "false")
+    orders, price = [], {"HOT": 50.4}
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity="88000", last_equity="88000")
+        def positions(self): return {}
+        def has_open_order(self, s): return False
+        def headlines(self, s): return []
+        def latest_prices(self, syms): return {s: price[s] for s in syms}
+        def enter(self, sym, side, plan, limit_price=None): orders.append((sym, side, plan, limit_price))
+
+    class FakeInPlay:
+        shortable = {"HOT"}
+        def __init__(self, cfg, mkt): pass
+        def pick(self, today):
+            return [("HOT", {"high": 50.5, "low": 49.9, "open": 50.0, "close": 50.4, "volume": 5000,
+                             "atr_d": 2.0, "rel_volume": 5.0})]
+
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "InPlayScanner", FakeInPlay)
+    monkeypatch.setattr(m.Bot, "_orb_window", lambda self: (True, True))
+    b = m.Bot(Config())
+    sent = []
+    b.notify.send = lambda kind, title, *a: sent.append((kind, title))
+    b.tick(market_open=True)                     # 50.40: inside the range, nothing
+    assert orders == [] and len(b.orb_list) == 1
+    price["HOT"] = 50.52
+    b.tick(market_open=True)                     # broke 50.50: buy, stop 0.20 below (10% of $2 ATR)
+    assert len(orders) == 1
+    sym, side, plan, cap = orders[0]
+    assert side == "buy" and plan.stop == pytest.approx(50.32) and plan.target is None
+    assert cap == pytest.approx(50.52 * 1.002)
+    assert plan.qty == min(int(88000 * 0.005 / 0.2), int(88000 * 0.10 / 50.52))
+    b.tick(market_open=True)                     # still above: no second trade in the same stock today
+    assert len(orders) == 1
+    assert any(t.startswith("BUY HOT") for _, t in sent)
+    assert "ordered" in (tmp_path / "trades.csv").read_text()
+
+
+def test_live_orb_skips_a_break_that_already_ran(monkeypatch, tmp_path):
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "t.csv")); monkeypatch.setenv("STRATEGY", "orb")
+    monkeypatch.setenv("TRADE_CRYPTO", "false"); monkeypatch.setenv("ORB_LLM", "false")
+    orders = []
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity="88000", last_equity="88000")
+        def positions(self): return {}
+        def has_open_order(self, s): return False
+        def headlines(self, s): return []
+        def latest_prices(self, syms): return {s: 51.5 for s in syms}   # $1 past a 50.50 break, $0.20 stop
+        def enter(self, *a, **k): orders.append(a)
+
+    class FakeInPlay:
+        shortable = set()
+        def __init__(self, cfg, mkt): pass
+        def pick(self, today):
+            return [("HOT", {"high": 50.5, "low": 49.9, "open": 50.0, "close": 50.4, "volume": 1, "atr_d": 2.0, "rel_volume": 3.0})]
+
+    monkeypatch.setattr(m, "Market", FakeMarket); monkeypatch.setattr(m, "InPlayScanner", FakeInPlay)
+    monkeypatch.setattr(m.Bot, "_orb_window", lambda self: (True, True))
+    b = m.Bot(Config()); b.notify.send = lambda *a: None
+    b.tick(market_open=True)
+    assert orders == [] and "HOT" in b.orb_done

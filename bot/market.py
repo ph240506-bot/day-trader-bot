@@ -10,7 +10,7 @@ from alpaca.data.requests import CryptoBarsRequest, NewsRequest, StockBarsReques
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, StopLossRequest, TakeProfitRequest
 
 log = logging.getLogger("market")
 
@@ -28,16 +28,16 @@ class Market:
         self.news = NewsClient(cfg.alpaca_key, cfg.alpaca_secret)
 
     # ---------- data ----------
-    def bars(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
+    def bars(self, symbols: list[str], days: int = 4) -> dict[str, pd.DataFrame]:
         tf = TimeFrame(self.cfg.bar_minutes, TimeFrameUnit.Minute)
-        start = datetime.now(timezone.utc) - timedelta(days=4)  # covers weekends for warm-up
+        start = datetime.now(timezone.utc) - timedelta(days=days)  # 4 covers weekends for warm-up
         out = {}
         stock_syms = [s for s in symbols if not is_crypto(s)]
         crypto_syms = [s for s in symbols if is_crypto(s)]
         try:
-            if stock_syms:
+            for i in range(0, len(stock_syms), 25):                  # batches: a 120-symbol request is slow
                 df = self.stocks.get_stock_bars(StockBarsRequest(
-                    symbol_or_symbols=stock_syms, timeframe=tf, start=start, feed=DataFeed.IEX)).df
+                    symbol_or_symbols=stock_syms[i:i + 25], timeframe=tf, start=start, feed=DataFeed.IEX)).df
                 out.update(_split(df))
             if crypto_syms:
                 df = self.crypto.get_crypto_bars(CryptoBarsRequest(
@@ -60,6 +60,18 @@ class Market:
         except Exception as e:
             log.debug("latest price %s failed: %s", symbol, e)
             return None
+
+    def latest_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Latest trade for many stocks in ONE request (ORB polls 20 names every 15 s)."""
+        if not symbols:
+            return {}
+        try:
+            from alpaca.data.requests import StockLatestTradeRequest
+            t = self.stocks.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=list(symbols), feed=DataFeed.IEX))
+            return {s: float(v.price) for s, v in t.items() if v and v.price}
+        except Exception as e:
+            log.debug("latest prices failed: %s", e)
+            return {}
 
     def headlines(self, symbol: str) -> list[str]:
         try:
@@ -89,17 +101,22 @@ class Market:
         return len(orders) > 0
 
     # ---------- orders ----------
-    def enter(self, symbol: str, side: str, plan):
+    def enter(self, symbol: str, side: str, plan, limit_price: float | None = None):
+        """Stocks: entry (market, or limit if limit_price) + stop-loss, + take-profit if the plan has a target.
+        No target (ORB holds to the close) = OTO order: entry that triggers just the stop."""
         side_enum = OrderSide.BUY if side == "buy" else OrderSide.SELL
         if is_crypto(symbol):
             # Crypto has no bracket orders on Alpaca: enter at market, the bot watches stop/target.
             req = MarketOrderRequest(symbol=symbol, qty=plan.qty, side=side_enum, time_in_force=TimeInForce.GTC)
+            return self.trading.submit_order(req)
+        legs = dict(stop_loss=StopLossRequest(stop_price=plan.stop))
+        if plan.target is not None:
+            legs.update(order_class=OrderClass.BRACKET, take_profit=TakeProfitRequest(limit_price=plan.target))
         else:
-            req = MarketOrderRequest(
-                symbol=symbol, qty=plan.qty, side=side_enum, time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(limit_price=plan.target),
-                stop_loss=StopLossRequest(stop_price=plan.stop))
+            legs.update(order_class=OrderClass.OTO)
+        common = dict(symbol=symbol, qty=plan.qty, side=side_enum, time_in_force=TimeInForce.DAY, **legs)
+        req = (LimitOrderRequest(limit_price=round(limit_price, 2), **common) if limit_price
+               else MarketOrderRequest(**common))
         return self.trading.submit_order(req)
 
     def close(self, symbol: str):

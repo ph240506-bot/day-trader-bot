@@ -64,6 +64,22 @@ class Config:
     # target is at least this far away, so a win actually beats the fees.
     min_crypto_target_pct: float = field(default_factory=lambda: _env("MIN_CRYPTO_TARGET_PCT", 1.5, float))
 
+    # Strategy: "orb" = opening range breakout on today's stocks in play (published edge), "ema" = original rules.
+    strategy: str = field(default_factory=lambda: _env("STRATEGY", "orb").lower())
+    orb_minutes: int = field(default_factory=lambda: _env("ORB_MINUTES", 5, int))
+    orb_top_n: int = field(default_factory=lambda: _env("ORB_TOP_N", 20, int))
+    orb_min_rel_volume: float = field(default_factory=lambda: _env("ORB_MIN_REL_VOLUME", 1.0, float))
+    orb_min_atr_dollars: float = field(default_factory=lambda: _env("ORB_MIN_ATR_DOLLARS", 0.5, float))
+    orb_stop_atr_frac: float = field(default_factory=lambda: _env("ORB_STOP_ATR_FRAC", 0.10, float))
+    orb_stop_mode: str = field(default_factory=lambda: _env("ORB_STOP_MODE", "atr").lower())   # atr | range
+    orb_min_stop_pct: float = field(default_factory=lambda: _env("ORB_MIN_STOP_PCT", 0.3, float))
+    orb_max_stop_pct: float = field(default_factory=lambda: _env("ORB_MAX_STOP_PCT", 3.0, float))
+    orb_target_r: float = field(default_factory=lambda: _env("ORB_TARGET_R", 0.0, float))        # 0 = hold to close
+    orb_entry_window_min: int = field(default_factory=lambda: _env("ORB_ENTRY_WINDOW_MIN", 60, int))
+    orb_candidates: int = field(default_factory=lambda: _env("ORB_CANDIDATES", 120, int))
+    orb_llm: bool = field(default_factory=lambda: _env("ORB_LLM", True, bool))
+    orb_poll_seconds: int = field(default_factory=lambda: _env("ORB_POLL_SECONDS", 15, int))
+
     # Risk
     risk_per_trade_pct: float = field(default_factory=lambda: _env("RISK_PER_TRADE_PCT", 0.5, float))
     max_position_pct: float = field(default_factory=lambda: _env("MAX_POSITION_PCT", 10.0, float))
