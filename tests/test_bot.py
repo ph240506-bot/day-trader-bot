@@ -385,3 +385,117 @@ def test_llm_tries_next_model_when_reply_unreadable(monkeypatch):
     replies["auto"] = "still thinking..."
     out = r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])
     assert out["decision"] == "veto" and "LLM skipped" in out["reason"]
+
+
+def test_cooldown_after_position_closes(monkeypatch, tmp_path):
+    """Night 3: TSLA stopped out, then traded again 8 min later. Now it waits REENTRY_COOLDOWN_MIN."""
+    import time
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "trades.csv"))
+    monkeypatch.setenv("SCAN_MOVERS", "false"); monkeypatch.setenv("TRADE_CRYPTO", "false")
+    orders, held = [], {"AAPL": object()}
+    bars = downtrend_then_breakout()
+    bars = pd.concat([bars, make_bars([105.2]).set_index(bars.index[-1:] + pd.Timedelta("5min"))])
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def account(self): return SimpleNamespace(equity="100000", last_equity="100000")
+        def bars(self, syms): return {"AAPL": bars}
+        def positions(self): return dict(held)
+        def has_open_order(self, s): return False
+        def headlines(self, s): return []
+        def enter(self, sym, side, plan): orders.append(sym)
+        def latest_price(self, s): return None
+
+    class FakeReviewer:
+        def __init__(self, cfg): self.client = True
+        def review(self, sig, chart, news): return {"decision": "approve", "confidence": 1, "reason": "ok"}
+
+    monkeypatch.setattr(m, "Market", FakeMarket)
+    monkeypatch.setattr(m, "Reviewer", FakeReviewer)
+    monkeypatch.setattr(m.Bot, "_in_entry_window", lambda self: True)
+    b = m.Bot(Config())
+    b.notify.send = lambda *a: None
+    b.tick(market_open=True)                 # holding AAPL: nothing to do
+    held.clear(); b.seen.clear()
+    b.tick(market_open=True)                 # AAPL just closed: cooldown, no new order
+    assert orders == [] and "AAPL" in b.last_exit
+    b.last_exit["AAPL"] = time.time() - 31 * 60; b.seen.clear()
+    b.tick(market_open=True)                 # 31 min later: allowed again
+    assert orders == ["AAPL"]
+
+
+# ---------------- backtest ----------------
+def _day_bars(day, prices, start="09:30"):
+    idx = pd.date_range(f"{day} {start}", periods=len(prices), freq="5min", tz="America/New_York")
+    p = np.array(prices, dtype=float)
+    return pd.DataFrame({"open": p, "high": p + 0.2, "low": p - 0.2, "close": p, "volume": 1000.0}, index=idx)
+
+
+def test_backtest_simulate_stop_target_and_flatten():
+    from bot.backtest import Setup, simulate
+    df = _day_bars("2026-11-02", [100, 100, 101, 102, 103, 104, 105, 106])
+    # long, ATR 1, stop 1 ATR, target 2R: enters at 100 (bar 1 open), target 102 hit on bar 3
+    r = simulate([Setup("X", "buy", 4, 0, 1.0)], df, 1.0, 2.0, 3, False, 30)
+    assert len(r) == 1 and r[0]["r"] == pytest.approx(2.0)
+    # short, same data: stop at 101 hit on bar 2 -> -1R
+    r = simulate([Setup("X", "sell", 4, 0, 1.0)], df, 1.0, 2.0, 3, False, 30)
+    assert r[0]["r"] == pytest.approx(-1.0)
+    # bar that touches both: count the stop (worst case)
+    both = df.copy(); both.iloc[2, both.columns.get_loc("high")] = 110; both.iloc[2, both.columns.get_loc("low")] = 90
+    assert simulate([Setup("X", "buy", 4, 0, 1.0)], both, 1.0, 2.0, 3, False, 30)[0]["r"] == pytest.approx(-1.0)
+    # filters: score too low / shorts excluded
+    assert simulate([Setup("X", "buy", 3, 0, 1.0)], df, 1.0, 2.0, 4, False, 30) == []
+    assert simulate([Setup("X", "sell", 4, 0, 1.0)], df, 1.0, 2.0, 3, True, 30) == []
+    # neither hit before 15:50 -> closed at the flatten bar's open
+    late = _day_bars("2026-11-02", [100] * 6, start="15:25")
+    r = simulate([Setup("X", "buy", 4, 0, 5.0)], late, 1.0, 2.0, 3, False, 30)
+    assert r[0]["r"] == pytest.approx(0.0) and r[0]["time"].strftime("%H:%M") == "15:30"
+
+
+def test_backtest_end_to_end_on_random_walk():
+    from bot.backtest import find_setups, grid, report
+    rng = np.random.default_rng(1)
+    frames = {}
+    for sym in ("AAA", "SPY"):
+        days = []
+        for d in pd.bdate_range("2026-08-03", periods=40):
+            p = 100 + np.cumsum(rng.normal(0, 0.3, 78))
+            days.append(_day_bars(d.date(), p))
+        df = pd.concat(days)
+        df["high"], df["low"] = df[["open", "close"]].max(axis=1) + 0.1, df[["open", "close"]].min(axis=1) - 0.1
+        df["volume"] = rng.integers(500, 5000, len(df)).astype(float)
+        frames[sym] = df
+    cfg = Config()
+    setups = {s: find_setups(s, frames[s], frames["SPY"], cfg) for s in frames}
+    assert setups["AAA"] and all(st.i + 1 < len(frames["AAA"]) for st in setups["AAA"])
+    for st in setups["AAA"]:      # never in the first 10 min or last 30 min
+        t = frames["AAA"].index[st.i] + pd.Timedelta("5min")
+        assert t.strftime("%H:%M") >= "09:40" and t.strftime("%H:%M") <= "15:30"
+    text = "\n".join(report(grid(setups, frames, cfg), cfg, 40, 2))
+    assert "Your current settings" in text and "Best 8" in text
+
+
+def test_flatten_retries_until_flat_and_reports_leftovers(monkeypatch):
+    """6 Nov: AAPL stayed open after the close because the close was refused while its legs cancelled."""
+    import time
+    from bot.market import Market
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    held = [["AAPL", "QQQ"], ["AAPL"], []]           # what's still open after each attempt
+
+    class FakeTrading:
+        calls = 0
+        def close_all_positions(self, cancel_orders):
+            assert cancel_orders
+            FakeTrading.calls += 1
+        def get_all_positions(self):
+            return [SimpleNamespace(symbol=s) for s in held[min(FakeTrading.calls, len(held)) - 1]]
+
+    m = Market.__new__(Market)
+    m.trading = FakeTrading()
+    assert m.flatten_all() == [] and FakeTrading.calls == 3
+    held[:] = [["AAPL"]] * 5
+    FakeTrading.calls = 0
+    assert m.flatten_all(tries=2) == ["AAPL"] and FakeTrading.calls == 2

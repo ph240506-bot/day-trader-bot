@@ -69,7 +69,7 @@ class FakeBrain:
     def __init__(self, verdict):
         self.verdict, self.calls = verdict, 0
 
-    async def judge(self, sym, text, ctx):
+    async def judge(self, sym, text, ctx, timeout=None):
         self.calls += 1
         return self.verdict
 
@@ -207,7 +207,7 @@ def test_parallel_events_respect_position_limit(tmp_path):
     from bot.smallcap.main import worker
 
     class SlowBrain(FakeBrain):
-        async def judge(self, *a):
+        async def judge(self, *a, **kw):
             await asyncio.sleep(0.2)
             return STRONG
 
@@ -424,6 +424,7 @@ def iso(dt):
 class FakeAlpaca(BaseHTTPRequestHandler):
     """Speaks Alpaca's real JSON wire format, so AlpacaBroker runs its true parsing code."""
     posted = []
+    trade_age = 3
 
     def _send(self, obj, code=200):
         data = json.dumps(obj).encode()
@@ -440,7 +441,7 @@ class FakeAlpaca(BaseHTTPRequestHandler):
                      "o": 3.2, "h": 4.5, "l": 3.1, "c": 4.1, "v": 900000, "n": 5000, "vw": 3.9}
         prev_bar = {"t": iso(now - timedelta(days=1)), "o": 3.0, "h": 3.1, "l": 2.9, "c": 3.0,
                     "v": 300000, "n": 900, "vw": 3.0}
-        snap = {"latestTrade": {"t": iso(now - timedelta(seconds=3)), "x": "V", "p": 4.12, "s": 100, "c": ["@"],
+        snap = {"latestTrade": {"t": iso(now - timedelta(seconds=FakeAlpaca.trade_age)), "x": "V", "p": 4.12, "s": 100, "c": ["@"],
                                 "i": 1, "z": "C"},
                 "latestQuote": {"t": iso(now), "ax": "V", "ap": 4.14, "as": 3, "bx": "V", "bp": 4.10, "bs": 2,
                                 "c": ["R"], "z": "C"},
@@ -528,7 +529,12 @@ def test_real_client_finnhub_and_shares(alpaca):
     broker, c = alpaca
     assert broker.quote("ABCD").price == 4.12                # no Finnhub key: Alpaca price
     c.finnhub_key = "fk"
-    q = broker.quote("ABCD")
+    assert broker.quote("ABCD").source == "alpaca-iex"       # Alpaca price 3s old: Finnhub not needed
+    FakeAlpaca.trade_age = 120                              # IEX hasn't printed for 2 min
+    try:
+        q = broker.quote("ABCD")
+    finally:
+        FakeAlpaca.trade_age = 3
     assert q.price == 4.20 and q.source == "finnhub"
     assert broker.shares_outstanding("ABCD") == 12_500_000   # Finnhub reports millions
     c.finnhub_key, c.edgar_user_agent = "", "test bot me@example.com"
@@ -853,7 +859,7 @@ def test_report_journal_sections(tmp_path):
     e = Engine(cfg(tmp_path), FakeBroker(mover(price=3.1, prev=3.0)), FakeBrain(STRONG), Sink())
     run(e.handle(ev()))
     out = "\n".join(journal_lines(str(tmp_path / "smallcap.csv"), "2000", "smallcap"))
-    assert "filtered 1" in out and "only +3.3%" in out
+    assert "filtered 1" in out and "only N%" in out
 
 
 def test_report_account_block_handles_alpaca_down(tmp_path, monkeypatch):
@@ -932,3 +938,172 @@ def test_orders_are_never_retried():
     from bot.smallcap.broker import AlpacaBroker
     for name in ("limit", "market_sell"):
         assert not hasattr(getattr(AlpacaBroker, name), "__wrapped__"), f"{name} must not auto-retry"
+
+
+def test_report_crypto_fee_residue_closes_trade():
+    """Real fills: Alpaca kept 0.25% of the BTC as a fee, so each sell was smaller than its buy."""
+    from bot.report import round_trips, summarize
+    fills = [
+        {"symbol": "BTC/USD", "side": "buy", "qty": "0.056812", "price": "78036.30", "transaction_time": "2026-11-03T14:36:00Z"},
+        {"symbol": "BTC/USD", "side": "sell", "qty": "0.056669969", "price": "77617.15", "transaction_time": "2026-11-03T14:51:00Z"},
+        {"symbol": "BTC/USD", "side": "buy", "qty": "0.056804", "price": "77912.36", "transaction_time": "2026-11-03T15:46:00Z"},
+        {"symbol": "BTC/USD", "side": "sell", "qty": "0.056661988", "price": "77501.41", "transaction_time": "2026-11-03T15:55:00Z"},
+    ]
+    trades = round_trips(fills)
+    assert len(trades) == 2
+    expected = (77617.15 - 78036.30) * 0.056669969 - (0.056812 - 0.056669969) * 78036.30
+    assert abs(trades[0]["pnl"] - round(expected, 2)) < 0.011
+    assert trades[0]["fees"] > 10
+    text = "\n".join(summarize(trades))
+    assert "Trades: 2" in text and "Crypto fees" in text
+
+
+def test_report_real_partial_close_not_treated_as_fee():
+    """A genuine half sell (50% left) must stay open, not be written off as a fee."""
+    from bot.report import round_trips
+    fills = [
+        {"symbol": "AAPL", "side": "buy", "qty": "10", "price": "100", "transaction_time": "2026-11-03T14:00:00Z"},
+        {"symbol": "AAPL", "side": "sell", "qty": "5", "price": "101", "transaction_time": "2026-11-03T14:10:00Z"},
+    ]
+    assert round_trips(fills) == []
+
+
+# ---------------- v8.3 ----------------
+def test_llm_parse_thinking_out_loud_then_answer():
+    """Night 2: a thinking model wrote notes (and echoed the schema) before the real answer."""
+    from bot.llm import parse as main_parse
+    reply = ('The user wants me to act as a cautious reviewer. The format is {"decision": "approve"|"veto", ...}. '
+             'RSI is 62, trend up, no event risk. Final answer:\n{"decision": "veto", "confidence": 0.7, '
+             '"reason": "volume fading"}')
+    assert main_parse(reply)["decision"] == "veto"
+    # the schema echo alone must NOT be read as an approval
+    import pytest
+    with pytest.raises(ValueError):
+        main_parse('The user wants me to reply {"decision": "approve"|"veto", "confidence": 0.0-1.0 and I need to')
+    assert main_parse('```json\n{"decision": "approve", "confidence": 0.8, "reason": "ok')["decision"] == "approve"
+    assert parse('notes {"verdict":"strong"|"weak"|"trap"} then {"verdict":"trap","confidence":0.9,"reason":"ATM"}'
+                 )["verdict"] == "trap"
+
+
+def test_llm_json_mode_falls_back_when_router_rejects_it(monkeypatch):
+    from openai import BadRequestError
+    from bot.config import Config
+    from bot.llm import Reviewer
+    from bot.strategy import Signal
+    from types import SimpleNamespace
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls.append("response_format" in kw)
+            if "response_format" in kw:
+                raise BadRequestError.__new__(BadRequestError)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"decision": "approve", "confidence": 0.8, "reason": "fine"}'))])
+
+    monkeypatch.setenv("LLM_API_KEY", "x")
+    r = Reviewer(Config())
+    r.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    assert r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])["decision"] == "approve"
+    assert r.review(Signal("NVDA", "buy", 4, 180.0, 1.0, []), {}, [])["decision"] == "approve"
+    assert calls == [True, False, False]          # tried JSON mode once, then stopped asking
+
+
+def test_brain_says_unreadable_not_timeout(tmp_path):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), RaceLLM)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    RaceLLM.delays, RaceLLM.replies = {}, {"junk": "The user wants me to judge this headline and I"}
+    c = cfg(tmp_path, llm_base_url=f"http://127.0.0.1:{srv.server_port}/v1", llm_api_key="k",
+            llm_models=["junk"], llm_timeout_sec=2.0)
+    b = Brain(c)
+    assert run(b.judge("ABCD", "FDA approval", {})) is None and b.last_fail == "unreadable"
+    RaceLLM.delays, RaceLLM.replies = {"slow": 1.0}, {}
+    c.llm_models = ["slow"]
+    t = time.time()
+    assert run(b.judge("ABCD", "x", {}, timeout=0.3)) is None and b.last_fail == "timeout"
+    assert time.time() - t < 0.9
+    RaceLLM.delays = {}
+    srv.shutdown()
+
+
+def test_report_groups_filter_reasons_and_formats_losses():
+    from bot.report import filter_kind, money
+    assert filter_kind("price data 237820s old") == filter_kind("price data 237829s old")
+    assert filter_kind("only +3.1% (need +8%)") == filter_kind("only +5.0% (need +8%)")
+    assert money(-22.08) == "-$22.08" and money(5) == "+$5.00"
+
+
+# ---------------- v8.4 ----------------
+class ClosingSoonBroker(FakeBroker):
+    mins = 18
+
+    def clock(self):
+        return True, None, datetime.now(timezone.utc) + timedelta(minutes=self.mins), None
+
+
+def test_no_smallcap_buy_late_in_the_day(tmp_path):
+    """Night 3: SNES bought at 15:42, forced out at 15:50. Now: no new buys in the last 30 min."""
+    b = ClosingSoonBroker(mover())
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "skip-late" and not b.placed
+    b2 = ClosingSoonBroker(mover())
+    b2.mins = 120
+    e2 = Engine(cfg(tmp_path / "x"), b2, FakeBrain(STRONG), Sink())
+    assert run(e2.handle(ev())) == "bought"
+
+
+def test_watch_dropped_near_close(tmp_path):
+    from bot.smallcap.engine import Watch
+    b = ClosingSoonBroker(mover())
+    e = Engine(cfg(tmp_path, entry_mode="pullback"), b, FakeBrain(STRONG), Sink())
+    e.watching["ABCD"] = Watch("ABCD", time.time(), 4.5, reason="x", text="x", base={"symbol": "ABCD"})
+    run(e.tick())
+    assert "ABCD" not in e.watching and not b.placed
+
+
+
+def test_premarket_stale_reason_and_looser_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
+    e = Engine(cfg(tmp_path), FakeBroker(mover(age=200_000)), FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "filtered"
+    assert "no pre-market trades yet" in open(e.cfg.journal_path).read()
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
+    e2 = Engine(cfg(tmp_path / "b"), FakeBroker(mover(age=120)), FakeBrain(STRONG), Sink())
+    assert run(e2.handle(ev())) == "bought"          # 2-min-old IEX print at the open is now usable
+
+
+# ---------------- v8.7 momentum mode ----------------
+WEAK = {"verdict": "weak", "confidence": 0.8, "reason": "No news found", "model": "fast"}
+NO_NEWS = "[Scanner: ABCD up +30% today; no news found in the last 24 hours]"
+
+
+def test_no_news_spike_passes_by_default(tmp_path):
+    b = FakeBroker(mover())
+    e = Engine(cfg(tmp_path), b, FakeBrain(WEAK), Sink())
+    assert run(e.handle(ev(text=NO_NEWS, source="scanner"))) == "pass" and not b.placed
+
+
+def test_momentum_mode_trades_half_size_only_when_volume_huge_and_float_small(tmp_path, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 0.5)      # 3M vs 1M at half-day = 6x pace
+    b = FakeBroker(mover())
+    e = Engine(cfg(tmp_path, trade_no_news=True), b, FakeBrain(WEAK), Sink())
+    assert run(e.handle(ev(text=NO_NEWS, source="scanner"))) == "bought"
+    qty = b.placed[0][1]
+    assert qty == 20                     # normal size here is 40 (see the first immediate-mode test)
+    assert "momentum, no news" in open(e.cfg.journal_path).read()
+    # too many shares -> no
+    b2 = FakeBroker(mover(), shares=60e6)
+    e2 = Engine(cfg(tmp_path / "b", trade_no_news=True, max_shares_m=100), b2, FakeBrain(WEAK), Sink())
+    assert run(e2.handle(ev(text=NO_NEWS, source="scanner"))) == "pass"
+    # volume not huge -> no
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 1.0)      # 3x
+    b3 = FakeBroker(mover())
+    e3 = Engine(cfg(tmp_path / "c", trade_no_news=True), b3, FakeBrain(WEAK), Sink())
+    assert run(e3.handle(ev(text=NO_NEWS, source="scanner"))) == "pass"
+    # AI says trap -> never
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 0.5)
+    trap = {"verdict": "trap", "confidence": 0.9, "reason": "offering", "model": "fast"}
+    b4 = FakeBroker(mover())
+    e4 = Engine(cfg(tmp_path / "d", trade_no_news=True), b4, FakeBrain(trap), Sink())
+    assert run(e4.handle(ev(text=NO_NEWS, source="scanner"))) != "bought" and not b4.placed

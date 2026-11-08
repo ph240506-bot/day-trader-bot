@@ -51,7 +51,7 @@ class SCConfig:
     max_stop_pct: float = field(default_factory=lambda: _e("SC_MAX_STOP_PCT", 10.0, float))
     reward_risk: float = field(default_factory=lambda: _e("SC_REWARD_RISK", 2.0, float))
     risk_per_trade_pct: float = field(default_factory=lambda: _e("SC_RISK_PER_TRADE_PCT", 1.0, float))
-    max_quote_age_sec: float = field(default_factory=lambda: _e("SC_MAX_QUOTE_AGE_SEC", 60.0, float))
+    max_quote_age_sec: float = field(default_factory=lambda: _e("SC_MAX_QUOTE_AGE_SEC", 180.0, float))
 
     # Sizing and exits
     position_usd: float = field(default_factory=lambda: _e("SC_POSITION_USD", 200.0, float))
@@ -82,6 +82,16 @@ class SCConfig:
     llm_api_key: str = field(default_factory=lambda: _e("LLM_API_KEY", ""))
     llm_models: list = field(default_factory=lambda: _e("SC_LLM_MODELS", ["auto:fast", "auto"], list))
     llm_timeout_sec: float = field(default_factory=lambda: _e("SC_LLM_TIMEOUT_SEC", 8.0, float))
+    # Night 3: bought SNES 18 min before the close and was forced out 8 min later. Leave room to work.
+    # Momentum mode: also trade stocks spiking with NO news, if volume is huge and few shares exist.
+    # Riskier (pump-and-dumps look like this), so it's off by default and trades at a smaller size.
+    trade_no_news: bool = field(default_factory=lambda: _e("SC_TRADE_NO_NEWS", False, bool))
+    no_news_min_rel_volume: float = field(default_factory=lambda: _e("SC_NO_NEWS_MIN_REL_VOLUME", 5.0, float))
+    no_news_max_shares_m: float = field(default_factory=lambda: _e("SC_NO_NEWS_MAX_SHARES_M", 20.0, float))
+    no_news_size: float = field(default_factory=lambda: _e("SC_NO_NEWS_SIZE", 0.5, float))
+    no_entry_before_close_min: float = field(default_factory=lambda: _e("SC_NO_ENTRY_BEFORE_CLOSE_MIN", 30.0, float))
+    # Top-gainer scanner hits are already moving and not a race against other news readers: wait longer.
+    scanner_llm_timeout_sec: float = field(default_factory=lambda: _e("SC_SCANNER_LLM_TIMEOUT_SEC", 20.0, float))
     llm_required: bool = field(default_factory=lambda: _e("SC_LLM_REQUIRED", True, bool))
 
     dry_run: bool = field(default_factory=lambda: _e("SC_DRY_RUN", False, bool))

@@ -102,6 +102,7 @@ class Engine:
         self.busy: set[str] = set()          # symbols being checked right now (no duplicate work)
         self.reserved = 0                     # buys in progress: count toward position/trade limits
         self._clock_cache = (None, 0.0)
+        self._mins_to_close = None
         self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
         self.summary_day = None
         self.exit_failed: set[str] = set()
@@ -161,7 +162,13 @@ class Engine:
         if is_open and next_close is not None:
             nc = next_close if next_close.tzinfo else next_close.replace(tzinfo=timezone.utc)
             mins_to_close = (nc - datetime.now(timezone.utc)).total_seconds() / 60
+        self._mins_to_close = mins_to_close
         return session(datetime.now(NY), is_open, mins_to_close)
+
+    def _too_late(self, sess) -> bool:
+        """Too close to the close to open a trade that needs time (max hold, pullback watch)."""
+        return (sess == "regular" and self._mins_to_close is not None
+                and self._mins_to_close < self.cfg.no_entry_before_close_min)
 
     # ---------- the fast path ----------
     async def handle(self, ev):
@@ -217,6 +224,8 @@ class Engine:
         sess = await self._session()
         if sess not in ("regular", "premarket") or (sess == "premarket" and not cfg.trade_premarket):
             return "skip-session"
+        if self._too_late(sess):
+            return "skip-late"
         if not await self._call(self.broker.asset_ok, sym):
             return "skip-asset"
 
@@ -231,7 +240,8 @@ class Engine:
 
         why = None
         if q.age_sec is not None and q.age_sec > cfg.max_quote_age_sec:
-            why = f"price data {q.age_sec:.0f}s old"
+            why = ("no pre-market trades yet" if sess == "premarket" and q.age_sec > 3600
+                   else f"price data {q.age_sec:.0f}s old")
         elif q.gap_pct < cfg.min_gap_pct:
             why = f"only {q.gap_pct:+.1f}% (need {cfg.min_gap_pct:+.0f}%)"
         elif q.rel_volume is not None and q.rel_volume < cfg.min_rel_volume:
@@ -254,16 +264,29 @@ class Engine:
             "price": q.price, "change_pct_today": round(q.gap_pct, 1),
             "volume_vs_yesterday": round(q.rel_volume, 2) if q.rel_volume else None,
             "shares_outstanding_millions": base.get("shares_m") or None,
-            "session": sess, "rule_check": f"{rule} ({matched})" if matched else rule})
+            "session": sess, "rule_check": f"{rule} ({matched})" if matched else rule},
+            timeout=cfg.scanner_llm_timeout_sec if ev.source == "scanner" else None)
         ai = verdict["verdict"] if verdict else "none"
         base.update(ai=ai, ai_model=verdict.get("model", "") if verdict else "")
         if verdict and ai == "trap":
             self.trap_today.add(sym)
         go = (ai == "strong" and verdict["confidence"] >= 0.6) or (
             verdict is None and not cfg.llm_required and rule == "strong")
+        momentum = (not go and cfg.trade_no_news and ev.source == "scanner" and "no news found" in ev.text
+                    and ai != "trap" and sym not in self.trap_today
+                    and q.rel_volume is not None and q.rel_volume >= cfg.no_news_min_rel_volume
+                    and base.get("shares_m") not in ("", None) and base["shares_m"] <= cfg.no_news_max_shares_m)
+        if momentum:
+            go = True
+            base.update(size_mult=cfg.no_news_size, rule="momentum")
         latency = int((time.time() - ev.received) * 1000)
         base["latency_ms"] = latency
-        reason = verdict["reason"] if verdict else ("rules only" if go else "AI didn't answer in time")
+        fail = getattr(self.brain, "last_fail", "timeout")
+        reason = (f"momentum, no news: volume {q.rel_volume:.0f}x normal, {base['shares_m']}M shares, "
+                  f"{cfg.no_news_size:.0%} size") if momentum else \
+            verdict["reason"] if verdict else ("rules only" if go else
+                                                    "AI replies unreadable" if fail == "unreadable" else
+                                                    "AI didn't answer in time")
         if not go:
             self.journal(**base, action="pass", reason=reason)
             self.notify.send("veto", f"Pass {sym} {q.gap_pct:+.0f}% (AI: {ai})",
@@ -293,6 +316,9 @@ class Engine:
 
     # ---------- entering ----------
     async def _enter(self, sym, q, stop, sess, base, reason, text):
+        if self._too_late(sess):
+            self.journal(**base, action="skipped", reason="too close to the close")
+            return "skip-late"
         # Check-and-reserve with no await in between, so parallel buys can't overshoot the limits.
         if self._slots_left() <= 0:
             self.journal(**base, action="skipped", reason="position/trade limit reached")
@@ -312,8 +338,10 @@ class Engine:
         if risk_per_share <= 0:
             self.journal(**base, action="skipped", reason="stop above entry")
             return "skip-stop"
-        dollars = min(cfg.position_usd, equity * cfg.max_position_pct / 100)
-        qty = min(math.floor(dollars / limit), math.floor(equity * cfg.risk_per_trade_pct / 100 / risk_per_share))
+        size = float(base.get("size_mult") or 1.0)          # momentum (no-news) trades are smaller
+        dollars = min(cfg.position_usd, equity * cfg.max_position_pct / 100) * size
+        qty = min(math.floor(dollars / limit),
+                  math.floor(equity * cfg.risk_per_trade_pct / 100 * size / risk_per_share))
         if qty < 1:
             self.journal(**base, action="skipped", reason=f"position too small (${dollars:.0f}, risk/share ${risk_per_share:.2f})")
             return "skip-size"
@@ -372,6 +400,10 @@ class Engine:
     async def manage_watch(self, quotes, sess):
         cfg = self.cfg
         for sym, w in list(self.watching.items()):
+            if self._too_late(sess):
+                self.watching.pop(sym)
+                self.journal(**w.base, action="watch-expired", reason="too close to the close")
+                continue
             if sess not in ("regular", "premarket") or time.time() - w.started > cfg.watch_min * 60:
                 self.watching.pop(sym)
                 self.journal(**w.base, action="watch-expired", reason=f"no clean pullback in {cfg.watch_min}m")

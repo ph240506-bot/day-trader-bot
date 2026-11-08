@@ -28,8 +28,11 @@ def evaluate(symbol: str, bars: pd.DataFrame, allow_short: bool = True) -> Signa
     if bars is None or len(bars) < 30:
         return None
     df = add_all(bars)
-    last, prev = df.iloc[-1], df.iloc[-2]
+    return signal_from_rows(symbol, df.iloc[-2], df.iloc[-1], allow_short)
 
+
+def signal_from_rows(symbol: str, prev, last, allow_short: bool = True) -> Signal | None:
+    """The scoring rules on two consecutive indicator rows (shared by the live bot and the backtest)."""
     crossed_up = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     crossed_dn = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
     vol_spike = last["vol_avg"] > 0 and last["volume"] > 1.5 * last["vol_avg"]

@@ -5,6 +5,7 @@ Run on the Pi:   botreport            (last 1 day)
 """
 import csv
 import os
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -16,7 +17,8 @@ def round_trips(fills: list[dict]) -> list[dict]:
     (e.g. old holdings sold at the open): it is ignored, never mistaken for a new short.
     Only 'sell_short' opens a short."""
     trades = []
-    book = defaultdict(lambda: {"lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0, "active": False})
+    book = defaultdict(lambda: {"lots": [], "pnl": 0.0, "opened": None, "side": None, "cost": 0.0, "active": False,
+                                "opened_qty": 0.0, "fees": 0.0})
     for f in sorted(fills, key=lambda x: x["transaction_time"]):
         sym = f["symbol"].replace("/", "")
         qty, price, side = float(f["qty"]), float(f["price"]), f["side"]
@@ -32,19 +34,31 @@ def round_trips(fills: list[dict]) -> list[dict]:
                 b["lots"].pop(0)
             else:
                 b["lots"][0][0] = lot_qty - take
+        # Crypto: Alpaca takes its fee out of the coins bought, so the sell is ~0.25% smaller than the buy.
+        # A leftover of <=1% of what was opened is that fee: treat the trade as closed and charge it.
+        if b["active"] and b["lots"] and remaining <= 1e-9 and sum(l[0] for l in b["lots"]) <= 0.01 * b["opened_qty"]:
+            b["pnl"] -= sum(l[0] * l[2] for l in b["lots"])
+            b["fees"] += sum(l[0] * l[2] for l in b["lots"])
+            b["lots"] = []
         if b["active"] and not b["lots"]:                                               # back to flat
             trades.append({"symbol": sym, "side": b["side"], "pnl": round(b["pnl"], 2), "opened": b["opened"],
-                           "closed": f["transaction_time"], "cost": round(b["cost"], 2)})
+                           "closed": f["transaction_time"], "cost": round(b["cost"], 2),
+                           "fees": round(b["fees"], 2)})
             b["active"] = False
         if remaining > 1e-9:
             if side == "sell" and not b["active"]:
                 continue                                     # plain sell, nothing open: pre-window holding
             if not b["active"]:
-                b.update(active=True, pnl=0.0, cost=0.0, opened=f["transaction_time"],
+                b.update(active=True, pnl=0.0, cost=0.0, opened=f["transaction_time"], opened_qty=0.0, fees=0.0,
                          side="long" if sign > 0 else "short")
+            b["opened_qty"] += remaining
             b["lots"].append([remaining, sign, price])
             b["cost"] += remaining * price
     return trades
+
+
+def money(v: float) -> str:
+    return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
 
 
 def summarize(trades: list[dict]) -> list[str]:
@@ -61,9 +75,12 @@ def summarize(trades: list[dict]) -> list[str]:
         f"Avg win: ${gross_win / len(wins) if wins else 0:,.2f}   Avg loss: -${gross_loss / len(losses) if losses else 0:,.2f}",
         f"  Profit factor: {gross_win / gross_loss:.2f}" if gross_loss > 0 else "  Profit factor: n/a (no losses)",
     ]
+    fees = sum(t.get("fees", 0) for t in trades)
+    if fees:
+        lines.append(f"  Crypto fees (included above): ${fees:,.2f}")
     best, worst = max(trades, key=lambda t: t["pnl"]), min(trades, key=lambda t: t["pnl"])
-    lines.append(f"  Best: {best['symbol']} {best['side']} +${best['pnl']:,.2f}   "
-                 f"Worst: {worst['symbol']} {worst['side']} ${worst['pnl']:,.2f}")
+    lines.append(f"  Best: {best['symbol']} {best['side']} {money(best['pnl'])}   "
+                 f"Worst: {worst['symbol']} {worst['side']} {money(worst['pnl'])}")
     by_sym = defaultdict(float)
     for t in trades:
         by_sym[t["symbol"]] += t["pnl"]
@@ -98,6 +115,12 @@ def read_csv(path, since):
     return [r for r in rows if r.get("time", "") >= since]
 
 
+def filter_kind(reason: str) -> str:
+    """Group filter reasons by type, so '237820s old' and '237829s old' count together."""
+    r = re.sub(r"[+-]?\d[\d.,]*", "N", reason)
+    return re.sub(r"\(need N%\)|\(max NM\)", "", r).strip()[:40]
+
+
 def journal_lines(path, since, kind) -> list[str]:
     rows = read_csv(path, since)
     if not rows:
@@ -108,19 +131,24 @@ def journal_lines(path, since, kind) -> list[str]:
         scores = Counter(r.get("score", "") for r in rows if r.get("action") == "ordered")
         if scores:
             lines.append("  Orders by score: " + ", ".join(f"{k}/5: {v}" for k, v in sorted(scores.items())))
-        vetoes = [r["llm_reason"] for r in rows if r.get("llm_decision") == "veto"][:5]
-        for v in vetoes:
+        vetoes = [r.get("llm_reason", "") for r in rows if r.get("llm_decision") == "veto"]
+        failed = [v for v in vetoes if v.startswith("LLM skipped")]
+        real = [v for v in vetoes if not v.startswith("LLM skipped")]
+        if vetoes:
+            lines.append(f"  AI vetoes: {len(real)} real, {len(failed)} where the AI gave no usable answer")
+        for v in real[-4:] + failed[-2:]:
             lines.append(f"    veto: {v[:110]}")
     else:
-        reasons = Counter((r.get("reason") or "")[:40] for r in rows if r.get("action") == "filtered")
+        reasons = Counter(filter_kind(r.get("reason") or "") for r in rows if r.get("action") == "filtered")
         if reasons:
-            lines.append("  Top filter reasons: " + "; ".join(f"{k} ({v})" for k, v in reasons.most_common(4)))
+            lines.append("  Top filter reasons: " + "; ".join(f"{k} ({v})" for k, v in reasons.most_common(6)))
         lat = [int(r["latency_ms"]) for r in rows if (r.get("latency_ms") or "").isdigit()]
         if lat:
             lat.sort()
             lines.append(f"  Decision speed: median {lat[len(lat) // 2] / 1000:.1f}s, slowest {lat[-1] / 1000:.1f}s")
         for r in [r for r in rows if r.get("action") in ("pass", "watching", "bought", "sold", "watch-failed", "faded")][-8:]:
-            lines.append(f"    {r.get('action')}: {r.get('symbol')} {r.get('gap_pct') or ''}% "
+            gap = f"{r['gap_pct']}% " if r.get("gap_pct") else ""
+            lines.append(f"    {r.get('action')}: {r.get('symbol')} {gap}"
                          f"AI={r.get('ai') or '-'} | {(r.get('reason') or '')[:80]}")
     return lines
 
@@ -173,7 +201,10 @@ def main():
     from .smallcap.config import SCConfig
     days = int(os.getenv("DAYS", "1"))
     cfg, sc = Config(), SCConfig()
-    out = [f"Report for the last {days} day(s), generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC", ""]
+    vf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION")
+    version = open(vf).read().strip() if os.path.exists(vf) else "unknown"
+    out = [f"Report for the last {days} day(s), generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC "
+           f"| bot version {version}", ""]
     out += account_block("Main bot", cfg.alpaca_key, cfg.alpaca_secret, cfg.paper, days, cfg.journal_path, "main")
     if sc.alpaca_key:
         out += [""] + account_block("Small-cap bot", sc.alpaca_key, sc.alpaca_secret, sc.paper, days,

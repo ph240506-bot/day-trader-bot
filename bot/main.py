@@ -37,6 +37,8 @@ class Bot:
         self._last_status = 0.0
         self.mins_to_close = 9999.0     # set by run() from Alpaca's clock (handles early-close days)
         self.seen_day = None
+        self.prev_positions: set[str] = set()
+        self.last_exit: dict[str, float] = {}    # symbol -> when its position closed
         self.scanner = MoverScanner(cfg, self.mkt.trading) if cfg.scan_movers else None
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         # Crypto stops/targets live here so a restart doesn't leave a position unmanaged.
@@ -102,6 +104,9 @@ class Bot:
             return
         bars = self.mkt.bars(symbols)
         positions = self.mkt.positions()
+        for k in self.prev_positions - set(positions):     # closed since last tick (stop, target or exit)
+            self.last_exit[k] = time.time()
+        self.prev_positions = set(positions)
         self.manage_crypto_exits(bars, positions)
         self.status(symbols, bars, equity, last_equity, positions, market_open)
         stock_entries_ok = market_open and self._in_entry_window()
@@ -140,6 +145,11 @@ class Bot:
             pos_key = sym.replace("/", "")
             if pos_key in positions or len(positions) >= self.cfg.max_open_positions:
                 continue
+            since_exit = time.time() - self.last_exit.get(pos_key, 0)
+            if since_exit < self.cfg.reentry_cooldown_min * 60:
+                log.info("Skip %s %s: closed a trade in it %.0f min ago (cooldown %d min)",
+                         sig.side, sym, since_exit / 60, self.cfg.reentry_cooldown_min)
+                continue
             if not self.cfg.dry_run and self.mkt.has_open_order(sym):
                 continue
 
@@ -151,6 +161,10 @@ class Bot:
                 log.info("Skip %s %s: price moved %.2f -> %.2f since the signal", sig.side, sym, sig.price, px)
                 continue
             plan = plan_order(sig.side, px, sig.atr, equity, self.cfg, fractional=is_crypto(sym))
+            if plan and is_crypto(sym) and abs(plan.target - px) / px * 100 < self.cfg.min_crypto_target_pct:
+                log.info("Skip %s %s: target only %.2f%% away, too small to beat ~0.5%% crypto fees",
+                         sig.side, sym, abs(plan.target - px) / px * 100)
+                continue
             row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "symbol": sym,
                    "side": sig.side, "score": sig.score, "price": sig.price,
                    "llm_decision": verdict["decision"], "llm_reason": verdict["reason"],
@@ -259,13 +273,15 @@ class Bot:
                 stocks_live = False
                 if flattened_for != clock.timestamp.date():
                     log.info("%.0f min to close: flattening for the day.", mins_to_close)
+                    left = [] if self.cfg.dry_run else (self.mkt.flatten_all() or [])
                     acct = self.mkt.account()
                     eq, prev = float(acct.equity), float(acct.last_equity)
                     self.notify.send("alert", "Market closing: positions closed",
                                      f"Account ${eq:,.2f}, today {eq - prev:+,.2f} ({(eq - prev) / prev * 100:+.2f}%)",
                                      3, "bell")
-                    if not self.cfg.dry_run:
-                        self.mkt.flatten_all()
+                    if left:
+                        self.notify.send("alert", f"COULDN'T CLOSE: {', '.join(left)}",
+                                         "Close it yourself in the Alpaca app (Positions -> Close).", 5, "warning")
                     self.crypto_exits.clear()
                     self._save_exits()
                     flattened_for = clock.timestamp.date()

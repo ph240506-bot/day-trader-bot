@@ -105,9 +105,27 @@ class Market:
     def close(self, symbol: str):
         return self.trading.close_position(symbol.replace("/", ""))
 
-    def flatten_all(self):
-        log.info("Flattening all positions and cancelling orders")
-        return self.trading.close_all_positions(cancel_orders=True)
+    def flatten_all(self, tries: int = 4, wait: float = 3.0) -> list[str]:
+        """Close everything, then CHECK. Night of 6 Nov: AAPL survived the close because a close can be
+        refused while its stop/target orders are still being cancelled. Returns symbols still open."""
+        import time
+        left: list[str] = []
+        for attempt in range(1, tries + 1):
+            log.info("Flattening all positions and cancelling orders (attempt %d)", attempt)
+            try:
+                self.trading.close_all_positions(cancel_orders=True)
+            except Exception as e:
+                log.warning("close_all_positions failed: %s", e)
+            time.sleep(wait)
+            try:
+                left = [p.symbol for p in self.trading.get_all_positions()]
+            except Exception as e:
+                log.warning("couldn't check positions after flatten: %s", e)
+                continue
+            if not left:
+                return []
+            log.warning("Still open after attempt %d: %s", attempt, ", ".join(left))
+        return left
 
 
 def _split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
