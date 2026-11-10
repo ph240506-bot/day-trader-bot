@@ -355,15 +355,19 @@ class Engine:
             self.trap_today.add(sym)
         go = (ai == "strong" and verdict["confidence"] >= 0.6) or (
             verdict is None and not cfg.llm_required and rule == "strong")
-        momentum = (not go and cfg.trade_no_news and ev.source == "scanner" and "no news found" in ev.text
-                    and ai != "trap" and sym not in self.trap_today
+        # Momentum: a stock already moving hard (scanner hit, or pre-market news re-checked at the open) that the
+        # AI called "weak" - no news, or a headline that doesn't explain the move - can still be traded on price
+        # action alone: huge volume, few shares, never a trap, smaller size. The AI must have ANSWERED "weak":
+        # no answer means nobody checked for an offering.
+        mover = ev.source == "scanner" or ev.parked
+        momentum = (not go and cfg.trade_no_news and mover and ai == "weak" and sym not in self.trap_today
                     and q.rel_volume is not None and q.rel_volume >= cfg.no_news_min_rel_volume
                     and base.get("shares_m") not in ("", None) and base["shares_m"] <= cfg.no_news_max_shares_m)
         if momentum:
             go = True
             base.update(size_mult=cfg.no_news_size, rule="momentum")
         momentum_miss = ""
-        if not go and ev.source == "scanner" and "no news found" in ev.text:
+        if not go and mover and ai == "weak":
             if not cfg.trade_no_news:
                 momentum_miss = "momentum mode is off"
             elif q.rel_volume is None:
@@ -377,14 +381,14 @@ class Engine:
         latency = int((time.time() - ev.received) * 1000)
         base["latency_ms"] = latency
         fail = getattr(self.brain, "last_fail", "timeout")
-        reason = (f"momentum, no news: volume {q.rel_volume:.0f}x normal, {base['shares_m']}M shares, "
-                  f"{cfg.no_news_size:.0%} size") if momentum else \
+        reason = (f"momentum: volume {q.rel_volume:.0f}x normal, {base['shares_m']}M shares, "
+                  f"{cfg.no_news_size:.0%} size. AI: {verdict['reason']}") if momentum else \
             verdict["reason"] if verdict else ("rules only" if go else
                                                     "AI replies unreadable" if fail == "unreadable" else
                                                     "AI didn't answer in time")
         if not go:
             if momentum_miss:
-                reason = f"no news; not a momentum trade: {momentum_miss}"
+                reason = f"{verdict['reason']} | not a momentum trade: {momentum_miss}"
             self.journal(**base, action="pass", reason=reason)
             self.notify.send("veto", f"Pass {sym} {q.gap_pct:+.0f}% (AI: {ai})",
                              f"${q.price:.2f}. {reason}\n{ev.text[:160]}", 2, "no_entry")

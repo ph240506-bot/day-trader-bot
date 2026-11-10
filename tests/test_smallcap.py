@@ -1093,7 +1093,7 @@ def test_momentum_mode_trades_half_size_only_when_volume_huge_and_float_small(tm
     assert run(e.handle(ev(text=NO_NEWS, source="scanner"))) == "bought"
     qty = b.placed[0][1]
     assert qty == 20                     # normal size here is 40 (see the first immediate-mode test)
-    assert "momentum, no news" in open(e.cfg.journal_path).read()
+    assert "momentum: volume" in open(e.cfg.journal_path).read()
     # too many shares -> no
     b2 = FakeBroker(mover(), shares=60e6)
     e2 = Engine(cfg(tmp_path / "b", trade_no_news=True, max_shares_m=100), b2, FakeBrain(WEAK), Sink())
@@ -1186,3 +1186,25 @@ def test_trap_news_removes_a_parked_stock(tmp_path, monkeypatch):
     assert "ABCD" in e.parked
     assert run(e.handle(ev(text="ABCD announces $10M registered direct offering"))) == "trap"
     assert "ABCD" not in e.parked
+
+
+# ---------------- v9.3: momentum on any mover the AI calls weak ----------------
+WEAK_NEWS = "[Scanner: ABCD up +30% today; this headline was published 2h ago] ABCD granted routine patent"
+
+
+def test_momentum_covers_movers_with_a_weak_headline_but_needs_an_ai_answer(tmp_path, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 0.5)       # 6x volume pace
+    weak = {"verdict": "weak", "confidence": 0.8, "reason": "Routine patent", "model": "fast"}
+    b = FakeBroker(mover())
+    e = Engine(cfg(tmp_path, trade_no_news=True), b, FakeBrain(weak), Sink())
+    assert run(e.handle(ev(text=WEAK_NEWS, source="scanner"))) == "bought" and b.placed[0][1] == 20   # half size
+    assert "AI: Routine patent" in open(e.cfg.journal_path).read()
+    # AI gave no answer: nobody ruled out an offering, so no momentum trade
+    b2 = FakeBroker(mover())
+    e2 = Engine(cfg(tmp_path / "b", trade_no_news=True), b2, FakeBrain(None), Sink())
+    assert run(e2.handle(ev(text=WEAK_NEWS, source="scanner"))) == "pass" and not b2.placed
+    # ordinary news feed item (not already a scanner mover): AI weak still means pass
+    b3 = FakeBroker(mover())
+    e3 = Engine(cfg(tmp_path / "c", trade_no_news=True), b3, FakeBrain(weak), Sink())
+    assert run(e3.handle(ev(text="ABCD granted routine patent", source="news"))) == "pass" and not b3.placed

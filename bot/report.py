@@ -117,8 +117,8 @@ def read_csv(path, since):
 
 def filter_kind(reason: str) -> str:
     """Group filter reasons by type, so '237820s old' and '237829s old' count together."""
-    r = re.sub(r"[+-]?\d[\d.,]*", "N", reason)
-    return re.sub(r"\(need N%\)|\(max NM\)", "", r).strip()[:40]
+    r = re.sub(r"[+-]?\d[\d.,]*", "N", reason.replace(" (parked news, final check)", " [parked]"))
+    return re.sub(r"\s*\(need N%\)|\s*\(max NM\)", "", r).strip()[:44]
 
 
 def journal_lines(path, since, kind) -> list[str]:
