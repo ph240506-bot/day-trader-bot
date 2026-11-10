@@ -122,26 +122,75 @@ class Market:
     def close(self, symbol: str):
         return self.trading.close_position(symbol.replace("/", ""))
 
-    def flatten_all(self, tries: int = 4, wait: float = 3.0) -> list[str]:
-        """Close everything, then CHECK. Night of 6 Nov: AAPL survived the close because a close can be
-        refused while its stop/target orders are still being cancelled. Returns symbols still open."""
+    def flatten_all(self, timeout: float = 45.0, poll: float = 2.0) -> list[str]:
+        """Close everything and CHECK. Returns the symbols still open (empty = flat).
+
+        Order matters (9 Nov: the old retry cancelled its own closing orders every 3 seconds):
+          1. cancel the open orders ONCE (stops/targets hold the shares, so a close is refused until they're gone)
+          2. wait until no orders are left
+          3. send one closing order per position
+          4. wait for the fills; only re-send for a symbol that has NO order working
+        Safe to call again later: it never cancels a closing order it sent in this call."""
         import time
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        t = self.trading
+
+        def open_orders():
+            return t.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+
+        def positions():
+            return [p.symbol for p in t.get_all_positions()]
+
+        log.info("Flattening: cancelling open orders")
+        try:
+            t.cancel_orders()
+        except Exception as e:
+            log.warning("cancel_orders failed: %s", e)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                if not open_orders():
+                    break
+            except Exception as e:
+                log.warning("couldn't list orders: %s", e)
+            time.sleep(poll)
+
         left: list[str] = []
-        for attempt in range(1, tries + 1):
-            log.info("Flattening all positions and cancelling orders (attempt %d)", attempt)
+        deadline = time.time() + timeout
+        while True:
+            # orders first, then positions: a close that fills between the two calls then just looks
+            # "still working" for one more pass, instead of looking like it needs a second closing order
             try:
-                self.trading.close_all_positions(cancel_orders=True)
-            except Exception as e:
-                log.warning("close_all_positions failed: %s", e)
-            time.sleep(wait)
+                working = {o.symbol.replace("/", "") for o in open_orders()}
+            except Exception:
+                working = None                            # can't tell: assume orders are working, don't double-send
             try:
-                left = [p.symbol for p in self.trading.get_all_positions()]
+                left = positions()
             except Exception as e:
-                log.warning("couldn't check positions after flatten: %s", e)
-                continue
-            if not left:
-                return []
-            log.warning("Still open after attempt %d: %s", attempt, ", ".join(left))
+                log.warning("couldn't check positions: %s", e)
+                left = left or ["?"]
+            if not left or left == ["?"] and time.time() >= deadline:
+                break
+            if working is None:
+                working = set(left)
+            for sym in left:
+                if sym in working or sym == "?":
+                    continue                              # its closing order is still working: leave it alone
+                try:
+                    t.close_position(sym)
+                    log.info("Closing %s", sym)
+                except Exception as e:
+                    log.warning("close %s failed: %s", sym, e)
+            if time.time() >= deadline:
+                break
+            time.sleep(poll)
+        try:
+            left = positions()
+        except Exception:
+            pass
+        if left:
+            log.warning("Still open after flatten: %s", ", ".join(left))
         return left
 
 

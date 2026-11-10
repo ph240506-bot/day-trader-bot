@@ -45,10 +45,12 @@ class Quote:
 
 
 def session_fraction(now=None) -> float:
-    """Share of the regular session elapsed (min 0.1 so the first minutes don't explode the ratio)."""
+    """Share of the regular session elapsed. Floor 0.05: the first few minutes really do carry about 5% of
+    a day's volume (trading is busiest at the open), so a stock isn't called quiet at 9:35 for not having
+    done 10% of yesterday's volume yet."""
     now = now or datetime.now(NY)
     mins = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
-    return min(1.0, max(0.1, mins / 390))
+    return min(1.0, max(0.05, mins / 390))
 
 
 def retry_once(fn):
@@ -253,7 +255,9 @@ class AlpacaBroker:
             try:
                 a = self.trading.get_asset(symbol)
                 exch = str(getattr(a.exchange, "value", a.exchange)).upper()
-                self._assets[symbol] = bool(a.tradable) and exch in MAJOR_EXCHANGES
+                from ..funds import looks_like_fund
+                self._assets[symbol] = (bool(a.tradable) and exch in MAJOR_EXCHANGES
+                                        and not looks_like_fund(getattr(a, "name", "")))
             except Exception:
                 self._assets[symbol] = False
         return self._assets[symbol]

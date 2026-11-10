@@ -435,27 +435,65 @@ def _day_bars(day, prices, start="09:30"):
     return pd.DataFrame({"open": p, "high": p + 0.2, "low": p - 0.2, "close": p, "volume": 1000.0}, index=idx)
 
 
-def test_flatten_retries_until_flat_and_reports_leftovers(monkeypatch):
-    """6 Nov: AAPL stayed open after the close because the close was refused while its legs cancelled."""
+class SlowAlpaca:
+    """Behaves like Alpaca on 9 Nov: stop orders hold the shares, closing orders need a few polls to fill,
+    and cancel_orders() cancels EVERYTHING open, closing orders included."""
+
+    def __init__(self, symbols, fill_after=2, stuck=()):
+        self.pos = set(symbols)
+        self.orders = [{"symbol": s, "kind": "stop", "age": 0} for s in symbols]
+        self.fill_after, self.stuck = fill_after, set(stuck)
+        self.cancel_calls, self.closes_sent, self.closes_cancelled = 0, [], 0
+
+    def _step(self):                                   # time passes on every query
+        for o in list(self.orders):
+            if o["kind"] == "close":
+                o["age"] += 1
+                if o["age"] >= self.fill_after and o["symbol"] not in self.stuck:
+                    self.orders.remove(o)
+                    self.pos.discard(o["symbol"])
+
+    def cancel_orders(self):
+        self.cancel_calls += 1
+        self.closes_cancelled += sum(o["kind"] == "close" for o in self.orders)
+        self.orders = []
+
+    def get_orders(self, req):
+        self._step()
+        return [SimpleNamespace(symbol=o["symbol"]) for o in self.orders]
+
+    def get_all_positions(self):
+        return [SimpleNamespace(symbol=s) for s in sorted(self.pos)]
+
+    def close_position(self, sym):
+        if any(o["symbol"] == sym and o["kind"] == "stop" for o in self.orders):
+            raise RuntimeError("insufficient qty available for order (held_for_orders)")
+        self.closes_sent.append(sym)
+        self.orders.append({"symbol": sym, "kind": "close", "age": 0})
+
+
+def test_flatten_cancels_once_and_never_cancels_its_own_closes(monkeypatch):
+    """9 Nov: seven positions survived the close because every retry cancelled the previous retry's sells."""
     import time
     from bot.market import Market
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    held = [["AAPL", "QQQ"], ["AAPL"], []]           # what's still open after each attempt
-
-    class FakeTrading:
-        calls = 0
-        def close_all_positions(self, cancel_orders):
-            assert cancel_orders
-            FakeTrading.calls += 1
-        def get_all_positions(self):
-            return [SimpleNamespace(symbol=s) for s in held[min(FakeTrading.calls, len(held)) - 1]]
-
     m = Market.__new__(Market)
-    m.trading = FakeTrading()
-    assert m.flatten_all() == [] and FakeTrading.calls == 3
-    held[:] = [["AAPL"]] * 5
-    FakeTrading.calls = 0
-    assert m.flatten_all(tries=2) == ["AAPL"] and FakeTrading.calls == 2
+    m.trading = SlowAlpaca(["AVGO", "HIMS", "KORU", "NVDX", "SOXL", "SOXX", "VOO"], fill_after=3)
+    assert m.flatten_all() == []
+    assert m.trading.cancel_calls == 1 and m.trading.closes_cancelled == 0
+    assert sorted(m.trading.closes_sent) == ["AVGO", "HIMS", "KORU", "NVDX", "SOXL", "SOXX", "VOO"]   # one each
+
+
+def test_flatten_reports_what_is_really_stuck(monkeypatch):
+    import time
+    from bot.market import Market
+    clock = [0.0]
+    monkeypatch.setattr(time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    m = Market.__new__(Market)
+    m.trading = SlowAlpaca(["AAPL", "HIMS"], stuck={"HIMS"})
+    assert m.flatten_all(timeout=20) == ["HIMS"]
+    assert m.trading.closes_sent.count("HIMS") == 1           # didn't spam duplicate closing orders
 
 
 # ---------------- v9: opening range breakout on stocks in play ----------------
@@ -628,3 +666,39 @@ def test_live_orb_skips_a_break_that_already_ran(monkeypatch, tmp_path):
     b = m.Bot(Config()); b.notify.send = lambda *a: None
     b.tick(market_open=True)
     assert orders == [] and "HOT" in b.orb_done
+
+
+def test_leftovers_closed_at_the_open_but_never_mid_day(monkeypatch, tmp_path):
+    import datetime as real
+    import bot.main as m
+    monkeypatch.setenv("ALPACA_API_KEY", "k"); monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("JOURNAL_PATH", str(tmp_path / "t.csv")); monkeypatch.setenv("STRATEGY", "orb")
+    flattened = []
+
+    class FakeMarket:
+        trading = None
+        def __init__(self, cfg): pass
+        def positions(self): return {"HIMS": 1, "VOO": 1}
+        def flatten_all(self): flattened.append(1); return []
+
+    class FakeInPlay:
+        shortable = set()
+        def __init__(self, cfg, mkt): pass
+
+    now = {"t": real.datetime(2026, 11, 10, 11, 0, tzinfo=m.NY)}
+
+    class FakeDT(real.datetime):
+        @classmethod
+        def now(cls, tz=None): return now["t"]
+
+    monkeypatch.setattr(m, "Market", FakeMarket); monkeypatch.setattr(m, "InPlayScanner", FakeInPlay)
+    monkeypatch.setattr(m, "datetime", FakeDT)
+    b = m.Bot(Config()); sent = []
+    b.notify.send = lambda kind, title, *a: sent.append(title)
+    b._close_leftovers()                                   # 11:00, e.g. after a botrestart: today's trades are safe
+    assert flattened == []
+    now["t"] = real.datetime(2026, 11, 11, 9, 31, tzinfo=m.NY)
+    b._close_leftovers()                                   # next morning, 9:31: leftovers go
+    assert flattened == [1] and "HIMS" in sent[0]
+    b._close_leftovers()                                   # only once per day
+    assert flattened == [1]

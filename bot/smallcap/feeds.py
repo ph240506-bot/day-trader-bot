@@ -33,6 +33,7 @@ class Event:
     at: datetime              # when it was published
     form: str = ""            # SEC form type for edgar events
     received: float = field(default_factory=time.time)
+    parked: bool = False      # pre-market news being re-checked at the open
 
     @property
     def key(self):

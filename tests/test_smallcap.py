@@ -904,7 +904,7 @@ def test_volume_pace_adjusted():
     from bot.smallcap.broker import session_fraction
     d = datetime(2026, 11, 3, 10, 35, tzinfo=NY)          # 65 min into a 390-min session
     assert abs(session_fraction(d) - 65 / 390) < 1e-9
-    assert session_fraction(d.replace(hour=9, minute=31)) == 0.1      # floor in the first minutes
+    assert session_fraction(d.replace(hour=9, minute=31)) == 0.05     # floor in the first minutes
     assert session_fraction(d.replace(hour=17)) == 1.0
     q = Quote(4.0, 3.0, 3.99, 4.01, day_volume=200_000, prev_volume=1_000_000)
     import bot.smallcap.broker as br
@@ -1066,7 +1066,7 @@ def test_watch_dropped_near_close(tmp_path):
 
 def test_premarket_stale_reason_and_looser_age(tmp_path, monkeypatch):
     monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
-    e = Engine(cfg(tmp_path), FakeBroker(mover(age=200_000)), FakeBrain(STRONG), Sink())
+    e = Engine(cfg(tmp_path, park_premarket=False), FakeBroker(mover(age=200_000)), FakeBrain(STRONG), Sink())
     assert run(e.handle(ev())) == "filtered"
     assert "no pre-market trades yet" in open(e.cfg.journal_path).read()
     monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
@@ -1109,3 +1109,80 @@ def test_momentum_mode_trades_half_size_only_when_volume_huge_and_float_small(tm
     b4 = FakeBroker(mover())
     e4 = Engine(cfg(tmp_path / "d", trade_no_news=True), b4, FakeBrain(trap), Sink())
     assert run(e4.handle(ev(text=NO_NEWS, source="scanner"))) != "bought" and not b4.placed
+
+
+# ---------------- v9.1 ----------------
+def test_funds_are_recognised_and_stocks_are_not():
+    from bot.funds import looks_like_fund as f
+    for n in ["Direxion Daily Semiconductor Bull 3X Shares", "iShares Semiconductor ETF", "Vanguard S&P 500 ETF",
+              "T-Rex 2X Long NVIDIA Daily Target ETF", "Tradr 2X Long ASTS Daily ETF",
+              "GraniteShares 2x Long ONDS Daily ETF", "SPDR S&P 500 ETF Trust", "ProShares UltraPro QQQ"]:
+        assert f(n), n
+    for n in ["Hims & Hers Health, Inc. Class A Common Stock", "Broadcom Inc. Common Stock",
+              "Alibaba Group Holding Limited American Depositary Shares each representing eight Ordinary share",
+              "Edesa Biotech, Inc. Common Shares", "Ultra Clean Holdings, Inc. Common Stock",
+              "Daily Journal Corp. (S.C.) Common Stock", "Northern Trust Corporation Common Stock",
+              "Bull Horn Holdings Corp. Ordinary Shares", "X Financial American Depositary Shares", "", None]:
+        assert not f(n), n
+
+
+def test_pass_reason_says_why_momentum_did_not_qualify(tmp_path, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 1.0)          # 3x volume: under the 5x bar
+    e = Engine(cfg(tmp_path, trade_no_news=True), FakeBroker(mover()), FakeBrain(WEAK), Sink())
+    assert run(e.handle(ev(text=NO_NEWS, source="scanner"))) == "pass"
+    assert "not a momentum trade: volume 3.0x, needs 5x" in open(e.cfg.journal_path).read()
+    e2 = Engine(cfg(tmp_path / "b"), FakeBroker(mover()), FakeBrain(WEAK), Sink())
+    run(e2.handle(ev(text=NO_NEWS, source="scanner")))
+    assert "momentum mode is off" in open(e2.cfg.journal_path).read()
+
+
+# ---------------- v9.2: pre-market news parked and re-checked at the open ----------------
+def test_premarket_news_is_parked_then_bought_at_the_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
+    b = FakeBroker(mover(age=200_000))                       # no pre-market price on the free feed
+    brain = FakeBrain(STRONG)
+    e = Engine(cfg(tmp_path), b, brain, Sink())
+    assert run(e.handle(ev())) == "parked" and "ABCD" in e.parked and brain.calls == 0 and not b.placed
+    run(e.tick())                                            # still pre-market: nothing happens
+    assert "ABCD" in e.parked and not b.placed
+    # the open: one minute in is too early, three minutes in the stock has a fresh price
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
+    monkeypatch.setattr(Engine, "_mins_since_open", lambda self: 1.0)
+    run(e.recheck_parked(wait=True))
+    assert "ABCD" in e.parked and not b.placed
+    b.q = mover(age=5)
+    monkeypatch.setattr(Engine, "_mins_since_open", lambda self: 3.0)
+    run(e.recheck_parked(wait=True))
+    assert "ABCD" not in e.parked and b.placed and b.placed[0][2] == "buy"
+    assert brain.calls == 1 and not e.busy
+    text = open(e.cfg.journal_path).read()
+    assert "parked" in text and "Pre-market news" in text and "bought" in text
+
+
+def test_parked_stock_gets_retries_then_one_final_logged_verdict(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
+    b = FakeBroker(mover(age=200_000))
+    e = Engine(cfg(tmp_path, park_retry_sec=0), b, FakeBrain(STRONG), Sink())
+    run(e.handle(ev()))
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "regular")
+    b.q = mover(price=3.1, prev=3.0, age=5)                  # trading now, but only +3%: not a mover (yet)
+    for mins in (3.0, 6.0, 9.0):
+        monkeypatch.setattr(Engine, "_mins_since_open", lambda self, m=mins: m)
+        run(e.recheck_parked(wait=True))
+    assert "ABCD" in e.parked
+    assert open(e.cfg.journal_path).read().count("filtered") == 0        # retries are silent
+    monkeypatch.setattr(Engine, "_mins_since_open", lambda self: 21.0)   # window over: final answer, logged once
+    run(e.recheck_parked(wait=True))
+    assert "ABCD" not in e.parked and not b.placed
+    text = open(e.cfg.journal_path).read()
+    assert text.count("filtered") == 1 and "parked news, final check" in text
+
+
+def test_trap_news_removes_a_parked_stock(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "session", lambda *a, **k: "premarket")
+    e = Engine(cfg(tmp_path), FakeBroker(mover(age=200_000)), FakeBrain(STRONG), Sink())
+    run(e.handle(ev()))
+    assert "ABCD" in e.parked
+    assert run(e.handle(ev(text="ABCD announces $10M registered direct offering"))) == "trap"
+    assert "ABCD" not in e.parked

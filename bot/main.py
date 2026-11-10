@@ -38,6 +38,9 @@ class Bot:
         self._last_status = 0.0
         self.mins_to_close = 9999.0     # set by run() from Alpaca's clock (handles early-close days)
         self.seen_day = None
+        self.flatten_left: list[str] = []        # symbols the pre-close flatten hasn't managed to close yet
+        self.flatten_alerted = False
+        self.leftover_day = None                 # date we last checked for positions left over from yesterday
         self.prev_positions: set[str] = set()
         self.last_exit: dict[str, float] = {}    # symbol -> when its position closed
         self.scanner = MoverScanner(cfg, self.mkt.trading) if (cfg.scan_movers and cfg.strategy != "orb") else None
@@ -294,6 +297,24 @@ class Bot:
                     self.notify.send("alert", f"Order failed: {sym}", str(e)[:300], 4, "warning")
             self.journal(row)
 
+    def _close_leftovers(self):
+        """This is a day-trading bot: anything still held when the market opens is a leftover from a failed
+        close, with its stop expired. Close it in the first minutes of the day, before any new trade."""
+        now = datetime.now(NY)
+        if self.leftover_day == now.date():
+            return
+        mins = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        if not (0 <= mins < min(self.cfg.orb_minutes, 5)):
+            return                                # a mid-day restart must not close today's trades
+        self.leftover_day = now.date()
+        held = [s for s in self.mkt.positions() if "USD" not in s]
+        if not held or self.cfg.dry_run:
+            return
+        log.warning("Positions left over from yesterday: %s. Closing them at the open.", ", ".join(held))
+        left = self.mkt.flatten_all()
+        self.notify.send("alert", "Closed yesterday's leftovers: " + ", ".join(held),
+                         ("Still open: " + ", ".join(left)) if left else "All closed at the open.", 4, "broom")
+
     def _in_entry_window(self) -> bool:
         now = datetime.now(NY)
         mins_since_open = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
@@ -366,20 +387,27 @@ class Bot:
             stocks_live = clock.is_open
             if clock.is_open and mins_to_close <= self.cfg.flatten_minutes_before_close:
                 stocks_live = False
-                if flattened_for != clock.timestamp.date():
-                    log.info("%.0f min to close: flattening for the day.", mins_to_close)
-                    left = [] if self.cfg.dry_run else (self.mkt.flatten_all() or [])
-                    acct = self.mkt.account()
-                    eq, prev = float(acct.equity), float(acct.last_equity)
-                    self.notify.send("alert", "Market closing: positions closed",
-                                     f"Account ${eq:,.2f}, today {eq - prev:+,.2f} ({(eq - prev) / prev * 100:+.2f}%)",
-                                     3, "bell")
-                    if left:
-                        self.notify.send("alert", f"COULDN'T CLOSE: {', '.join(left)}",
+                first = flattened_for != clock.timestamp.date()
+                if first or self.flatten_left:              # keep trying every pass until the bell
+                    log.info("%.1f min to close: flattening for the day.", mins_to_close)
+                    self.flatten_left = [] if self.cfg.dry_run else (self.mkt.flatten_all() or [])
+                    if first:
+                        acct = self.mkt.account()
+                        eq, prev = float(acct.equity), float(acct.last_equity)
+                        self.notify.send("alert", "Market closing: positions closed" if not self.flatten_left
+                                         else "Market closing: still closing " + ", ".join(self.flatten_left),
+                                         f"Account ${eq:,.2f}, today {eq - prev:+,.2f} ({(eq - prev) / prev * 100:+.2f}%)",
+                                         3, "bell")
+                    if self.flatten_left and mins_to_close <= 1.5 and not self.flatten_alerted:
+                        self.flatten_alerted = True         # one loud alert, only if it's really stuck near the bell
+                        self.notify.send("alert", f"COULDN'T CLOSE: {', '.join(self.flatten_left)}",
                                          "Close it yourself in the Alpaca app (Positions -> Close).", 5, "warning")
                     self.crypto_exits.clear()
                     self._save_exits()
                     flattened_for = clock.timestamp.date()
+            elif clock.is_open:
+                self.flatten_alerted = False
+                self._close_leftovers()
             if not clock.is_open and not self.cfg.trade_crypto:
                 wait = (clock.next_open - clock.timestamp).total_seconds()
                 if wait > self.cfg.wait_for_open_minutes * 60:

@@ -32,7 +32,7 @@ class SCConfig:
     min_gap_pct: float = field(default_factory=lambda: _e("SC_MIN_GAP_PCT", 8.0, float))
     # Today's volume vs yesterday's full-day volume (IEX feed undercounts, ratio still useful)
     min_rel_volume: float = field(default_factory=lambda: _e("SC_MIN_REL_VOLUME", 1.0, float))
-    max_spread_pct: float = field(default_factory=lambda: _e("SC_MAX_SPREAD_PCT", 2.0, float))
+    max_spread_pct: float = field(default_factory=lambda: _e("SC_MAX_SPREAD_PCT", 3.0, float))
     max_news_age_sec: int = field(default_factory=lambda: _e("SC_MAX_NEWS_AGE_SEC", 180, int))
 
     # Share count ("float" stand-in): fewer shares = moves faster on buying pressure
@@ -83,6 +83,13 @@ class SCConfig:
     llm_models: list = field(default_factory=lambda: _e("SC_LLM_MODELS", ["auto:fast", "auto"], list))
     llm_timeout_sec: float = field(default_factory=lambda: _e("SC_LLM_TIMEOUT_SEC", 8.0, float))
     # Night 3: bought SNES 18 min before the close and was forced out 8 min later. Leave room to work.
+    # The free feed has no pre-market prices for most small caps, and that's when the real news lands.
+    # Instead of throwing that news away, park the stock and re-check it in the first minutes after the open.
+    park_premarket: bool = field(default_factory=lambda: _e("SC_PARK_PREMARKET", True, bool))
+    park_start_min: float = field(default_factory=lambda: _e("SC_PARK_START_MIN", 2.0, float))     # after the open
+    park_window_min: float = field(default_factory=lambda: _e("SC_PARK_WINDOW_MIN", 20.0, float))
+    park_retry_sec: float = field(default_factory=lambda: _e("SC_PARK_RETRY_SEC", 60.0, float))
+    park_max: int = field(default_factory=lambda: _e("SC_PARK_MAX", 80, int))
     # Momentum mode: also trade stocks spiking with NO news, if volume is huge and few shares exist.
     # Riskier (pump-and-dumps look like this), so it's off by default and trades at a smaller size.
     trade_no_news: bool = field(default_factory=lambda: _e("SC_TRADE_NO_NEWS", False, bool))

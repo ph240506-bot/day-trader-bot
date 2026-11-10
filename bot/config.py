@@ -78,6 +78,9 @@ class Config:
     orb_entry_window_min: int = field(default_factory=lambda: _env("ORB_ENTRY_WINDOW_MIN", 60, int))
     orb_candidates: int = field(default_factory=lambda: _env("ORB_CANDIDATES", 120, int))
     orb_llm: bool = field(default_factory=lambda: _env("ORB_LLM", True, bool))
+    # ETFs and leveraged funds are skipped by default: the research is on stocks, and SOXL + SOXX + NVDX
+    # in one morning is one semiconductor bet placed three times.
+    orb_allow_funds: bool = field(default_factory=lambda: _env("ORB_ALLOW_FUNDS", False, bool))
     orb_poll_seconds: int = field(default_factory=lambda: _env("ORB_POLL_SECONDS", 15, int))
 
     # Risk

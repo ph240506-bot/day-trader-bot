@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -102,6 +102,8 @@ class Engine:
         self.busy: set[str] = set()          # symbols being checked right now (no duplicate work)
         self.reserved = 0                     # buys in progress: count toward position/trade limits
         self._clock_cache = (None, 0.0)
+        self.parked: dict[str, dict] = {}     # symbol -> pre-market news waiting for a price at the open
+        self._bg: set = set()                 # background re-check tasks (kept so they aren't garbage-collected)
         self._mins_to_close = None
         self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
         self.summary_day = None
@@ -140,6 +142,7 @@ class Engine:
             self.traded_today.clear()
             self.trap_today.clear()
             self.watching.clear()
+            self.parked.clear()
             self.trades_today = 0
             self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
 
@@ -193,6 +196,7 @@ class Engine:
             rule, matched = "trap", ev.form
         if rule == "trap":
             self.trap_today.add(sym)       # e.g. offering filed today: ignore later "good news" on it
+            self.parked.pop(sym, None)
             if sym in self.watching:
                 self.watching.pop(sym)
                 self.notify.send("veto", f"Dropped {sym} from watchlist", f"Trap news: {matched}", 3, "warning")
@@ -219,7 +223,80 @@ class Engine:
         finally:
             self.busy.discard(sym)
 
-    async def _evaluate(self, ev, rule, matched):
+    # ---------- pre-market news, re-checked at the open ----------
+    def _park(self, ev, rule, matched, base) -> bool:
+        cfg = self.cfg
+        if not cfg.park_premarket or ev.parked:
+            return False
+        old = self.parked.get(ev.symbol)
+        if old and old["rule"] == "strong" and rule != "strong":
+            return True                               # keep the stronger headline we already hold
+        if not old and len(self.parked) >= cfg.park_max:
+            weak = next((s for s, p in self.parked.items() if p["rule"] != "strong"), None)
+            if weak is None and rule != "strong":
+                return False
+            self.parked.pop(weak or next(iter(self.parked)))
+        self.parked[ev.symbol] = {"ev": ev, "rule": rule, "matched": matched, "next": 0.0}
+        self.journal(**base, action="parked", reason="no pre-market price; will re-check at the open")
+        return True
+
+    def _mins_since_open(self) -> float:
+        now = datetime.now(NY)
+        return (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+
+    async def recheck_parked(self, wait: bool = False):
+        """In the first minutes of the regular session, give parked pre-market news a second look."""
+        if not self.parked:
+            return
+        if await self._session() != "regular":
+            return
+        mins = self._mins_since_open()
+        if mins < self.cfg.park_start_min:
+            return
+        last_chance = mins >= self.cfg.park_window_min
+        tasks = []
+        for sym, p in list(self.parked.items()):
+            if sym in self.busy or (time.time() < p["next"] and not last_chance):
+                continue
+            p["next"] = time.time() + self.cfg.park_retry_sec
+            if last_chance:
+                self.parked.pop(sym, None)
+            self.busy.add(sym)
+            tasks.append(asyncio.create_task(self._recheck_one(sym, p, last_chance)))
+            if len(tasks) >= 6:                       # a few at a time: never starve exits of API calls
+                break
+        if wait:
+            await asyncio.gather(*tasks)
+        else:
+            for t in tasks:
+                self._bg.add(t)
+                t.add_done_callback(self._bg.discard)
+
+    async def _recheck_one(self, sym, p, last_chance):
+        try:
+            if (sym in self.trap_today or sym in self.traded_today or sym in self.positions or sym in self.watching
+                    or self.halted_day == self.day or (self.halts and sym in self.halts.halted)):
+                self.parked.pop(sym, None)
+                return "skip-sym"
+            if self._slots_left() <= 0:
+                return "skip-limits"                  # stays parked: a slot may free up
+            ev = p["ev"]
+            at = ev.at if ev.at.tzinfo else ev.at.replace(tzinfo=timezone.utc)
+            age_min = max(0, (datetime.now(timezone.utc) - at).total_seconds() / 60)
+            ago = f"{age_min / 60:.1f}h" if age_min >= 90 else f"{age_min:.0f} min"
+            ev2 = replace(ev, text=f"[Pre-market news, published {ago} ago, re-checked at the open] {ev.text}"[:500],
+                          received=time.time(), parked=True)
+            # quiet until the last try: too early, the stock may simply not have traded enough yet
+            result = await self._evaluate(ev2, p["rule"], p["matched"], quiet_filter=not last_chance)
+            if result != "filtered":
+                self.parked.pop(sym, None)            # decided (bought / watching / passed): done with it
+            return result
+        except Exception as e:
+            log.warning("re-check of %s failed: %s", sym, e)
+        finally:
+            self.busy.discard(sym)
+
+    async def _evaluate(self, ev, rule, matched, quiet_filter=False):
         sym, cfg = ev.symbol, self.cfg
         sess = await self._session()
         if sess not in ("regular", "premarket") or (sess == "premarket" and not cfg.trade_premarket):
@@ -240,8 +317,12 @@ class Engine:
 
         why = None
         if q.age_sec is not None and q.age_sec > cfg.max_quote_age_sec:
-            why = ("no pre-market trades yet" if sess == "premarket" and q.age_sec > 3600
-                   else f"price data {q.age_sec:.0f}s old")
+            if sess == "premarket" and q.age_sec > 3600:
+                if self._park(ev, rule, matched, base):
+                    return "parked"
+                why = "no pre-market trades yet"
+            else:
+                why = f"price data {q.age_sec:.0f}s old"
         elif q.gap_pct < cfg.min_gap_pct:
             why = f"only {q.gap_pct:+.1f}% (need {cfg.min_gap_pct:+.0f}%)"
         elif q.rel_volume is not None and q.rel_volume < cfg.min_rel_volume:
@@ -256,7 +337,9 @@ class Engine:
             elif shares is not None and shares > cfg.max_shares_m * 1e6:
                 why = f"{shares / 1e6:.0f}M shares (max {cfg.max_shares_m:.0f}M)"
         if why:
-            self.journal(**base, action="filtered", reason=why, latency_ms=int((time.time() - ev.received) * 1000))
+            if not quiet_filter:
+                self.journal(**base, action="filtered", latency_ms=int((time.time() - ev.received) * 1000),
+                             reason=(why + " (parked news, final check)") if ev.parked else why)
             return "filtered"
 
         # 3. AI race (only for stocks that pass every cheap check)
@@ -265,7 +348,7 @@ class Engine:
             "volume_vs_yesterday": round(q.rel_volume, 2) if q.rel_volume else None,
             "shares_outstanding_millions": base.get("shares_m") or None,
             "session": sess, "rule_check": f"{rule} ({matched})" if matched else rule},
-            timeout=cfg.scanner_llm_timeout_sec if ev.source == "scanner" else None)
+            timeout=cfg.scanner_llm_timeout_sec if (ev.source == "scanner" or ev.parked) else None)
         ai = verdict["verdict"] if verdict else "none"
         base.update(ai=ai, ai_model=verdict.get("model", "") if verdict else "")
         if verdict and ai == "trap":
@@ -279,6 +362,18 @@ class Engine:
         if momentum:
             go = True
             base.update(size_mult=cfg.no_news_size, rule="momentum")
+        momentum_miss = ""
+        if not go and ev.source == "scanner" and "no news found" in ev.text:
+            if not cfg.trade_no_news:
+                momentum_miss = "momentum mode is off"
+            elif q.rel_volume is None:
+                momentum_miss = "no volume data yet"
+            elif q.rel_volume < cfg.no_news_min_rel_volume:
+                momentum_miss = f"volume {q.rel_volume:.1f}x, needs {cfg.no_news_min_rel_volume:.0f}x"
+            elif base.get("shares_m") in ("", None):
+                momentum_miss = "share count unknown"
+            elif base["shares_m"] > cfg.no_news_max_shares_m:
+                momentum_miss = f"{base['shares_m']:.0f}M shares, max {cfg.no_news_max_shares_m:.0f}M"
         latency = int((time.time() - ev.received) * 1000)
         base["latency_ms"] = latency
         fail = getattr(self.brain, "last_fail", "timeout")
@@ -288,6 +383,8 @@ class Engine:
                                                     "AI replies unreadable" if fail == "unreadable" else
                                                     "AI didn't answer in time")
         if not go:
+            if momentum_miss:
+                reason = f"no news; not a momentum trade: {momentum_miss}"
             self.journal(**base, action="pass", reason=reason)
             self.notify.send("veto", f"Pass {sym} {q.gap_pct:+.0f}% (AI: {ai})",
                              f"${q.price:.2f}. {reason}\n{ev.text[:160]}", 2, "no_entry")
@@ -389,6 +486,7 @@ class Engine:
     async def tick(self):
         """Called every couple of seconds: one batched price request for everything we care about."""
         self._new_day()
+        await self.recheck_parked()
         symbols = list(dict.fromkeys(list(self.positions) + list(self.watching)))
         if not symbols:
             return

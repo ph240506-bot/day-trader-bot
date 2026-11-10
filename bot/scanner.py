@@ -10,6 +10,8 @@ from alpaca.data.enums import MostActivesBy
 from alpaca.data.historical.screener import ScreenerClient
 from alpaca.data.requests import MarketMoversRequest, MostActivesRequest
 
+from .funds import looks_like_fund
+
 log = logging.getLogger("scanner")
 
 
@@ -99,6 +101,8 @@ class InPlayScanner:
                 continue
             a = self._asset(sym)
             if a is None or not getattr(a, "tradable", False):
+                continue
+            if not self.cfg.orb_allow_funds and looks_like_fund(getattr(a, "name", "")):
                 continue
             out.append(sym)
             if getattr(a, "easy_to_borrow", False) and getattr(a, "shortable", False):

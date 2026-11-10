@@ -70,9 +70,9 @@ async def heartbeat(engine, broker, stats, stop):
             seen = sum(stats.values())
             ignored = sum(v for k, v in stats.items() if k.startswith("skip") or k in ("dupe", "stale"))
             log.info("Status: %s | events %d (ignored %d: big caps/OTC/repeats, filtered %d, passed %d, watching %d, "
-                     "bought %d, traps %d) | equity $%s (today %+.2f) | watchlist: %s | positions: %s",
-                     session(datetime.now(NY), is_open), seen, ignored, stats.get("filtered", 0), stats.get("pass", 0),
-                     stats.get("watching", 0), stats.get("bought", 0), stats.get("trap", 0), f"{equity:,.2f}",
+                     "bought %d, traps %d) | parked for the open: %d | equity $%s (today %+.2f) | watchlist: %s | positions: %s",
+                     session(datetime.now(NY), is_open), seen, ignored, stats.get("filtered", 0) + stats.get("parked", 0), stats.get("pass", 0),
+                     stats.get("watching", 0), stats.get("bought", 0), stats.get("trap", 0), len(engine.parked), f"{equity:,.2f}",
                      equity - last,
                      ", ".join(f"{w.symbol} ({w.state}, high {w.high:.2f})" for w in engine.watching.values()) or "none",
                      ", ".join(f"{p.symbol} x{p.qty:g} @ {p.entry:.2f} stop {p.stop:.2f}"
