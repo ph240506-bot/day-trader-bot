@@ -433,7 +433,8 @@ class Engine:
     async def _enter_reserved(self, sym, q, stop, sess, base, reason, text):
         cfg = self.cfg
         equity, _ = await self._call(self.broker.account)
-        ask = q.ask if q.ask > 0 else q.price
+        # IEX's ask can sit far above the real market's: never let it drag the limit more than 1% over the last price
+        ask = min(q.ask, q.price * 1.01) if q.ask > 0 else q.price
         limit = round_price(ask * (1 + cfg.entry_slippage_pct / 100))
         risk_per_share = limit - stop
         if risk_per_share <= 0:

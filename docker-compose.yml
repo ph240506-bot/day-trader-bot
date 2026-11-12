@@ -49,5 +49,24 @@ services:
       - ./journal:/app/journal
     logging: *logging
 
+  opend:
+    # moomoo's OpenD gateway: live whole-market prices for the small-cap bot. Intel-only program, so it runs
+    # under emulation on the Pi. Turned on by adding "moomoo" to COMPOSE_PROFILES (scripts/moomoo_setup.sh).
+    build:
+      context: docker/opend
+      args:
+        OPEND_URL: ${MOOMOO_OPEND_URL:-}
+    platform: linux/amd64
+    profiles: ["moomoo"]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      MOOMOO_LOGIN: ${MOOMOO_LOGIN:-}
+      MOOMOO_PASSWORD: ${MOOMOO_PASSWORD:-}
+    volumes:
+      - ./opend-data:/root          # keeps the "trusted device" login so it doesn't ask for a code every restart
+    logging: *logging
+
 volumes:
   freellmapi-data:

@@ -17,6 +17,13 @@ alias botupdate='cd $BOTDIR && git pull && docker compose up -d --build && echo 
 alias botversion='cat $BOTDIR/VERSION 2>/dev/null || echo unknown'
 botreport() { cd $BOTDIR && docker compose exec -T -e DAYS="${DAYS:-1}" bot python -m bot.report; }
 botbacktest() { cd $BOTDIR && docker compose exec -T -e DAYS="${DAYS:-90}" bot python -m bot.backtest; }
+# --- moomoo live prices (optional; set up with: bash ~/day-trader-bot/scripts/moomoo_setup.sh) ---
+alias moomoolog='cd $BOTDIR && docker compose logs -f --tail 40 opend'
+moomoocode() { cd $BOTDIR && docker compose exec -T opend python3 /usr/local/bin/send.py input_phone_verify_code -code="$1"; }
+moomoopic()  { cd $BOTDIR && docker compose exec -T opend python3 /usr/local/bin/send.py input_pic_verify_code -code="$1"; }
+moomootest() { cd $BOTDIR && docker compose exec -T -e SC_MOOMOO=true smallcap python -m bot.smallcap.moomoo_test "$@"; }
+moomooon()  { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=true" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices ON"; }
+moomoooff() { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=false" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices OFF"; }
 alias botexport='cd $BOTDIR && docker compose exec -T bot python - < scripts/export_fills.py'
 
 # --- safety ---
@@ -48,6 +55,7 @@ bottemp     live temperature (Ctrl+C to stop)
 botrestart  restart main bot         screstart  restart small-cap bot
 botupdate   install an update (after pushing from your Mac)
 botreport   performance report (DAYS=30 botreport for a month) - paste it to Claude
+  moomoolog / moomoocode 123456 / moomootest / moomooon / moomoooff   moomoo live prices
   botbacktest compare ORB vs EMA on 90 days of real data, net of costs (~10 min; DAYS=180 botbacktest)
 botexport   export all fills from Alpaca (for the monthly review)
 botpanic    EMERGENCY: stop both bots + close every position

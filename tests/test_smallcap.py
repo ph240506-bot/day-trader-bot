@@ -425,6 +425,7 @@ class FakeAlpaca(BaseHTTPRequestHandler):
     """Speaks Alpaca's real JSON wire format, so AlpacaBroker runs its true parsing code."""
     posted = []
     trade_age = 3
+    delayed_status, delayed_calls = 200, 0
 
     def _send(self, obj, code=200):
         data = json.dumps(obj).encode()
@@ -447,7 +448,15 @@ class FakeAlpaca(BaseHTTPRequestHandler):
                                 "c": ["R"], "z": "C"},
                 "minuteBar": today_bar, "dailyBar": today_bar, "prevDailyBar": prev_bar}
         if u.path == "/v2/stocks/snapshots":
-            assert q.get("feed") == "iex"
+            assert q.get("feed") in ("iex", "delayed_sip")
+            if q["feed"] == "delayed_sip":
+                FakeAlpaca.delayed_calls += 1
+                if FakeAlpaca.delayed_status != 200:
+                    return self._send({"message": "subscription does not permit querying recent SIP data"},
+                                      FakeAlpaca.delayed_status)
+                # the whole market: a 1-cent spread and 30x the volume IEX saw
+                snap = {**snap, "latestQuote": {**snap["latestQuote"], "ap": 4.13, "bp": 4.12},
+                        "dailyBar": {**today_bar, "v": 27_000_000}, "prevDailyBar": {**prev_bar, "v": 3_000_000}}
             syms = q["symbols"].split(",")
             return self._send({s: snap for s in syms if s != "NODATA"})
         if u.path == "/v2/stocks/bars":
@@ -1208,3 +1217,108 @@ def test_momentum_covers_movers_with_a_weak_headline_but_needs_an_ai_answer(tmp_
     b3 = FakeBroker(mover())
     e3 = Engine(cfg(tmp_path / "c", trade_no_news=True), b3, FakeBrain(weak), Sink())
     assert run(e3.handle(ev(text="ABCD granted routine patent", source="news"))) == "pass" and not b3.placed
+
+
+# ---------------- v9.4: whole-market (delayed) spread and volume ----------------
+def test_spread_and_volume_come_from_the_whole_market_when_available(alpaca, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 1.0)
+    broker, c = alpaca
+    FakeAlpaca.delayed_status = 200
+    q = broker.quote("ABCD")
+    assert q.price == 4.12                                   # live price: still IEX
+    assert round(q.iex_spread_pct, 2) == 0.97                # IEX book: 4.10 / 4.14
+    assert round(q.spread_pct, 2) == 0.24                    # real market: 4.12 / 4.13
+    assert q.volume_source == "market-delayed" and q.rel_volume == 9.0     # 27M vs 3M, not IEX's 900k vs 300k
+
+
+def test_delayed_feed_refused_falls_back_to_iex_and_stops_asking(alpaca, monkeypatch):
+    import bot.smallcap.broker as br
+    monkeypatch.setattr(br, "session_fraction", lambda now=None: 1.0)
+    broker, c = alpaca
+    FakeAlpaca.delayed_status, FakeAlpaca.delayed_calls = 403, 0
+    try:
+        q = broker.quote("ABCD")
+        assert round(q.spread_pct, 2) == 0.97 and q.rel_volume == 3.0 and q.volume_source == "iex"
+        assert broker.delayed_ok is False
+        broker.quote("ABCD")
+        assert FakeAlpaca.delayed_calls == 1                 # asked once, then never again
+    finally:
+        FakeAlpaca.delayed_status = 200
+
+
+def test_wide_iex_ask_does_not_inflate_the_buy_limit(tmp_path):
+    b = FakeBroker(mover(price=4.0, prev=3.0, bid=3.9, ask=4.6))     # IEX ask 15% above the last trade
+    b.q.market_spread_pct = 0.3                                        # real market is tight
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    assert run(e.handle(ev())) == "bought"
+    assert b.placed[0][3] == round_price(4.0 * 1.01 * 1.01)            # capped near the last price, not 4.6
+
+
+# ---------------- v9.5: moomoo live prices ----------------
+def _moomoo_row(**kw):
+    from datetime import datetime as dt
+    from bot.smallcap.moomoo_feed import NY as MNY
+    row = {"code": "US.ABCD", "update_time": dt.now(MNY).strftime("%Y-%m-%d %H:%M:%S"), "last_price": 4.30,
+           "prev_close_price": 3.0, "bid_price": 4.29, "ask_price": 4.31, "pre_price": 0.0, "suspension": False,
+           "outstanding_shares": 12_000_000}
+    row.update(kw)
+    return row
+
+
+def test_moomoo_row_rules():
+    from datetime import datetime as dt, timedelta as td
+    from bot.smallcap.moomoo_feed import NY as MNY, row_to_tick
+    noon = dt.now(MNY).replace(hour=12, minute=0, second=0, microsecond=0)
+    stamp = lambda t: t.strftime("%Y-%m-%d %H:%M:%S")
+    t = row_to_tick(_moomoo_row(update_time=stamp(noon - td(seconds=5))), now=noon)
+    assert t["price"] == 4.30 and t["age_sec"] == 5 and t["shares"] == 12_000_000 and not t["premarket"]
+    assert row_to_tick(_moomoo_row(update_time=stamp(noon - td(hours=20))), now=noon)["age_sec"] == 72000   # stale shows as stale
+    assert row_to_tick(_moomoo_row(update_time=stamp(noon + td(hours=13))), now=noon) is None   # wrong time zone: untrusted
+    assert row_to_tick(_moomoo_row(update_time="N/A"), now=noon) is None
+    assert row_to_tick(_moomoo_row(update_time=stamp(noon), suspension=True), now=noon) is None
+    assert row_to_tick(_moomoo_row(update_time=stamp(noon), last_price=float("nan")), now=noon) is None
+    early = noon.replace(hour=8)
+    pm = row_to_tick(_moomoo_row(update_time=stamp(early), pre_price=4.80), now=early)
+    assert pm["price"] == 4.80 and pm["premarket"]                    # before the open: the pre-market price
+
+
+def test_moomoo_feed_reads_snapshot_and_backs_off_when_down():
+    import pandas as pd
+    from bot.smallcap.moomoo_feed import MoomooFeed
+    calls = []
+
+    class Ctx:
+        fail = False
+        def get_market_snapshot(self, codes):
+            calls.append(codes)
+            if Ctx.fail:
+                return -1, "disconnected"
+            return 0, pd.DataFrame([_moomoo_row()])
+
+    f = MoomooFeed(ctx_factory=Ctx)
+    assert f.snapshot(["ABCD"])["ABCD"]["price"] == 4.30 and calls[0] == ["US.ABCD"]
+    Ctx.fail = True
+    assert f.snapshot(["ABCD"]) == {}
+    n = len(calls)
+    assert f.snapshot(["ABCD"]) == {} and len(calls) == n            # backed off: didn't even ask
+
+
+def test_broker_prefers_fresh_moomoo_price_over_stale_iex(alpaca, monkeypatch):
+    broker, c = alpaca
+
+    class Feed:
+        def snapshot(self, syms):
+            return {"ABCD": {"price": 4.30, "prev_close": 3.0, "bid": 4.29, "ask": 4.31, "age_sec": 4.0,
+                             "shares": 12e6, "premarket": False}}
+
+    broker.moomoo = Feed()
+    FakeAlpaca.trade_age = 600                               # IEX hasn't seen a trade for 10 minutes
+    try:
+        q = broker.quotes(["ABCD"])["ABCD"]
+    finally:
+        FakeAlpaca.trade_age = 3
+    assert q.source == "moomoo" and q.price == 4.30 and q.age_sec == 4.0 and (q.bid, q.ask) == (4.29, 4.31)
+    assert broker.shares_outstanding("ABCD") == 12e6        # share count comes along for free
+    q2 = broker.quotes(["ABCD"])["ABCD"]                     # IEX is 3 s old now: fresher, keep it
+    assert q2.source == "alpaca-iex" and q2.price == 4.12

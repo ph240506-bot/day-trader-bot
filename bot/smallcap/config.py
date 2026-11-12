@@ -90,6 +90,12 @@ class SCConfig:
     park_window_min: float = field(default_factory=lambda: _e("SC_PARK_WINDOW_MIN", 20.0, float))
     park_retry_sec: float = field(default_factory=lambda: _e("SC_PARK_RETRY_SEC", 60.0, float))
     park_max: int = field(default_factory=lambda: _e("SC_PARK_MAX", 80, int))
+    # moomoo OpenAPI live prices (needs the opend container: scripts/moomoo_setup.sh). Off until tested.
+    moomoo: bool = field(default_factory=lambda: _e("SC_MOOMOO", False, bool))
+    moomoo_host: str = field(default_factory=lambda: _e("SC_MOOMOO_HOST", "opend"))
+    moomoo_port: int = field(default_factory=lambda: _e("SC_MOOMOO_PORT", 11111, int))
+    # Use Alpaca's free 15-minute-delayed whole-market feed for the spread and volume checks (never for price).
+    use_delayed_sip: bool = field(default_factory=lambda: _e("SC_USE_DELAYED_SIP", True, bool))
     # Momentum mode: also trade stocks spiking with NO news, if volume is huge and few shares exist.
     # Riskier (pump-and-dumps look like this), so it's off by default and trades at a smaller size.
     trade_no_news: bool = field(default_factory=lambda: _e("SC_TRADE_NO_NEWS", False, bool))

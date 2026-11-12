@@ -24,16 +24,25 @@ class Quote:
     prev_volume: float | None
     source: str = "alpaca-iex"
     age_sec: float | None = None      # how old the last trade is
+    market_spread_pct: float | None = None   # whole-market spread ~15 min ago (IEX's own book is far wider)
+    volume_source: str = "iex"
 
     @property
     def gap_pct(self):
         return (self.price / self.prev_close - 1) * 100 if self.prev_close else 0.0
 
     @property
-    def spread_pct(self):
+    def iex_spread_pct(self):
         if self.bid > 0 and self.ask > 0 and self.ask >= self.bid:
             return (self.ask - self.bid) / ((self.ask + self.bid) / 2) * 100
         return None
+
+    @property
+    def spread_pct(self):
+        """Best evidence of the real spread. IEX is one small exchange, so its spread is always at least as
+        wide as the whole market's: when we also have the whole-market figure, the tighter one is the truth."""
+        known = [s for s in (self.iex_spread_pct, self.market_spread_pct) if s is not None]
+        return min(known) if known else None
 
     @property
     def rel_volume(self):
@@ -133,6 +142,16 @@ class AlpacaBroker:
         self._shares: dict[str, float | None] = {}
         self._cik: dict[str, int] | None = None
         self.finnhub_limit = RateLimiter(50, 60)       # free tier is 60/min; keep headroom
+        self.delayed_ok = cfg.use_delayed_sip          # switched off for good if Alpaca refuses the feed
+        self.delayed_limit = RateLimiter(60, 60)
+        self.moomoo = None
+        if getattr(cfg, "moomoo", False):
+            try:
+                from .moomoo_feed import MoomooFeed
+                self.moomoo = MoomooFeed(cfg.moomoo_host, cfg.moomoo_port)
+                log.info("moomoo live prices: on (%s:%s)", cfg.moomoo_host, cfg.moomoo_port)
+            except Exception as e:
+                log.warning("moomoo prices not available: %s", e)
         self._http_get = http_get or self._default_get
 
     @staticmethod
@@ -165,6 +184,20 @@ class AlpacaBroker:
                         out[s] = q
                 except Exception as e2:
                     log.debug("snapshot %s failed: %s", s, e2)
+        if self.moomoo:
+            for s, t in self.moomoo.snapshot(list(symbols)).items():
+                have = out.get(s)
+                # take moomoo's price when it is fresher than what IEX gave us (it usually is for small caps)
+                if have and have.age_sec is not None and have.age_sec <= t["age_sec"]:
+                    continue
+                q = have or Quote(0, 0, 0, 0, None, None)
+                q.price, q.age_sec, q.source = t["price"], t["age_sec"], "moomoo"
+                q.prev_close = t["prev_close"] or q.prev_close
+                if t["bid"] > 0 and t["ask"] >= t["bid"]:
+                    q.bid, q.ask = t["bid"], t["ask"]
+                if t["shares"] > 0 and self._shares.get(s) is None:
+                    self._shares[s] = t["shares"]
+                out[s] = q
         for s in finnhub_for:
             have = out.get(s)
             if have and have.age_sec is not None and have.age_sec <= 20:
@@ -178,7 +211,34 @@ class AlpacaBroker:
         return out
 
     def quote(self, symbol: str) -> Quote | None:
-        return self.quotes([symbol], finnhub_for={symbol}).get(symbol)
+        q = self.quotes([symbol], finnhub_for={symbol}).get(symbol)
+        return self._add_market_view(symbol, q) if q else q
+
+    def _add_market_view(self, symbol, q: Quote) -> Quote:
+        """Spread and volume from the whole market, 15 minutes delayed (free). The live PRICE still comes
+        from IEX/Finnhub: a 15-minute-old price is useless for trading, but a 15-minute-old spread or
+        volume figure describes the stock far better than IEX's sliver of the market does."""
+        if not self.delayed_ok or not self.delayed_limit.allow():
+            return q
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockSnapshotRequest
+        try:
+            snaps = self.data.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol, feed=DataFeed.DELAYED_SIP))
+            d = snapshot_to_quote(snaps.get(symbol))
+        except Exception as e:
+            msg = str(e).lower()
+            if any(w in msg for w in ("subscription", "forbidden", "403", "not permitted", "invalid feed", "422")):
+                self.delayed_ok = False
+                log.warning("Delayed whole-market feed not available on this plan (%s). Using IEX only.", str(e)[:100])
+            else:
+                log.debug("delayed snapshot %s failed: %s", symbol, e)
+            return q
+        if not d:
+            return q
+        q.market_spread_pct = d.iex_spread_pct           # same maths, whole-market quote
+        if d.day_volume and d.prev_volume:
+            q.day_volume, q.prev_volume, q.volume_source = d.day_volume, d.prev_volume, "market-delayed"
+        return q
 
     def _finnhub(self, symbol):
         if not self.cfg.finnhub_key or not self.finnhub_limit.allow():
