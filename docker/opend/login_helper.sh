@@ -23,7 +23,7 @@ while true; do
   [ -z "$newest" ] && continue
   if [ "$newest" != "$logfile" ]; then logfile="$newest"; handled=0; fi
   # last prompt-ish line and its line number
-  hit=$(grep -anE "strDescUTF8  =  (Please enter account|Please enter password|Login successful)" "$logfile" | tail -1)
+  hit=$(grep -anE "strDescUTF8  =  (Please enter account|Please enter password|Please choose whether to remember|Login successful)" "$logfile" | tail -1)
   [ -z "$hit" ] && continue
   n=${hit%%:*}
   [ "$n" -le "$handled" ] && continue
@@ -39,6 +39,9 @@ while true; do
       attempts=$((attempts + 1))
       echo "[login helper] answering the account prompt (attempt $attempts)"
       send "$MOOMOO_LOGIN" && handled=$n ;;
+    *"remember"*)
+      echo "[login helper] answering 'remember the password?' with Y"
+      send "Y" && handled=$n ;;
     *"Please enter password"*)
       if [ ! -s "$PWFILE" ]; then
         echo "[login helper] no saved password: run  bash ~/day-trader-bot/scripts/moomoo_setup.sh --password"
