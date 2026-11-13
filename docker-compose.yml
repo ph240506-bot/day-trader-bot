@@ -63,7 +63,7 @@ services:
     tty: true
     environment:
       MOOMOO_LOGIN: ${MOOMOO_LOGIN:-}
-      MOOMOO_PASSWORD: ${MOOMOO_PASSWORD:-}
+      MOOMOO_PASSWORD_MD5: ${MOOMOO_PASSWORD_MD5:-}
     volumes:
       - ./opend-data:/root          # keeps the "trusted device" login so it doesn't ask for a code every restart
     logging: *logging
