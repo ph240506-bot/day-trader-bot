@@ -63,9 +63,9 @@ services:
     tty: true
     environment:
       MOOMOO_LOGIN: ${MOOMOO_LOGIN:-}
-      MOOMOO_PASSWORD_MD5: ${MOOMOO_PASSWORD_MD5:-}
     volumes:
       - ./opend-data:/root          # keeps the "trusted device" login so it doesn't ask for a code every restart
+      - ./secrets:/run/secrets:ro   # the moomoo password, in a private file (see scripts/moomoo_setup.sh)
     logging: *logging
 
 volumes:

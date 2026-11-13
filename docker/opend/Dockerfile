@@ -14,5 +14,5 @@ RUN python /build/fetch.py "$OPEND_URL" /out
 FROM ubuntu:22.04
 COPY --from=fetch /out /opt/opend
 COPY --from=fetch /etc/ssl/certs /etc/ssl/certs
-COPY --chmod=755 entrypoint.sh send.sh /usr/local/bin/
+COPY --chmod=755 entrypoint.sh send.sh login_helper.sh /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

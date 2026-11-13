@@ -15,20 +15,20 @@ ask() {  # ask VAR "prompt" [secret]
 
 echo "== moomoo live prices: setup =="
 ask MOOMOO_LOGIN "moomoo ID, phone number or email you log in with"
-# Password: stored only as its MD5 fingerprint, which is what OpenD wants anyway. (A raw password containing
-# $ # quotes or backslashes gets mangled by the .env file, and the login is then refused.)
-sed -i '/^MOOMOO_PASSWORD=/d' $ENV
-if ! grep -qE '^MOOMOO_PASSWORD_MD5=[0-9a-f]{32}$' $ENV || [ "$1" = "--password" ]; then
+# Password: this version of OpenD only logs in by being asked at its prompt, so the Pi has to answer with
+# the real password. It is kept in a private file only this user can read (not in .env, never in GitHub).
+sed -i '/^MOOMOO_PASSWORD=/d;/^MOOMOO_PASSWORD_MD5=/d' $ENV
+mkdir -p secrets && chmod 700 secrets
+if [ ! -s secrets/moomoo_password ] || [ "$1" = "--password" ]; then
   read -r -s -p "moomoo login password (nothing shows as you type): " PW; echo
   read -r -s -p "type it once more to be sure: " PW2; echo
   [ "$PW" = "$PW2" ] || { echo "Those didn't match. Run the script again."; exit 1; }
   [ -n "$PW" ] || { echo "Empty password. Run the script again."; exit 1; }
-  sed -i '/^MOOMOO_PASSWORD_MD5=/d' $ENV
-  printf 'MOOMOO_PASSWORD_MD5=%s\n' "$(printf '%s' "$PW" | md5sum | cut -d' ' -f1)" >> $ENV
+  ( umask 077; printf '%s' "$PW" > secrets/moomoo_password )
   unset PW PW2
-  echo "Password saved (as a fingerprint, not the password itself)."
+  echo "Password saved to a private file on this Pi."
 else
-  echo "moomoo password already set (to change it: bash scripts/moomoo_setup.sh --password)"
+  echo "moomoo password already saved (to change it: bash scripts/moomoo_setup.sh --password)"
 fi
 ask MOOMOO_OPEND_URL "The 'Download Ubuntu' link from moomoo's OpenAPI page (long-press the link, copy, paste)"
 
@@ -47,5 +47,6 @@ docker compose build opend
 docker compose up -d --force-recreate opend
 echo
 echo "Started. Now run:   moomoolog"
+echo "  - It logs itself in (look for 'answering the account prompt' then 'Login successful')."
 echo "  - If it asks for a phone verification code, run:   moomoocode 123456   (your code)"
 echo "  - When it says login succeeded, run:   moomootest"
