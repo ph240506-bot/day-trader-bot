@@ -19,8 +19,8 @@ botreport() { cd $BOTDIR && docker compose exec -T -e DAYS="${DAYS:-1}" bot pyth
 botbacktest() { cd $BOTDIR && docker compose exec -T -e DAYS="${DAYS:-90}" bot python -m bot.backtest; }
 # --- moomoo live prices (optional; set up with: bash ~/day-trader-bot/scripts/moomoo_setup.sh) ---
 alias moomoolog='cd $BOTDIR && docker compose logs -f --tail 40 opend'
-moomoocode() { cd $BOTDIR && docker compose exec -T opend python3 /usr/local/bin/send.py input_phone_verify_code -code="$1"; }
-moomoopic()  { cd $BOTDIR && docker compose exec -T opend python3 /usr/local/bin/send.py input_pic_verify_code -code="$1"; }
+moomoocode() { cd $BOTDIR && docker compose exec -T opend /usr/local/bin/send.sh input_phone_verify_code -code="$1"; }
+moomoopic()  { cd $BOTDIR && docker compose exec -T opend /usr/local/bin/send.sh input_pic_verify_code -code="$1"; }
 moomootest() { cd $BOTDIR && docker compose exec -T -e SC_MOOMOO=true smallcap python -m bot.smallcap.moomoo_test "$@"; }
 moomooon()  { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=true" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices ON"; }
 moomoooff() { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=false" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices OFF"; }

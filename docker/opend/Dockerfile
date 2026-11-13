@@ -1,13 +1,18 @@
 # moomoo OpenD (the gateway moomoo's API talks to). moomoo only ships it for Intel/AMD chips, so on the
-# Raspberry Pi this image runs under emulation (see scripts/moomoo_setup.sh).
-FROM --platform=linux/amd64 ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl tar python3-minimal libstdc++6 libgcc-s1 && rm -rf /var/lib/apt/lists/*
+# Raspberry Pi the final image runs under emulation.
+#
+# Nothing is INSTALLED under emulation: the emulator crashes on Ubuntu's package tools (ldconfig), so the
+# download, unpacking and config are all done in a native stage, and the Intel stage only copies files in.
+
+# ---- stage 1: native (runs at full speed on the Pi) ----
+FROM --platform=$BUILDPLATFORM python:3.12-slim AS fetch
 ARG OPEND_URL
-RUN test -n "$OPEND_URL" || (echo "MOOMOO_OPEND_URL is not set in .env (the 'Download Ubuntu' link from moomoo's OpenAPI page)" && exit 1)
-RUN mkdir -p /opt/opend && curl -fL --retry 3 "$OPEND_URL" -o /tmp/opend.tgz \
-    && tar -xzf /tmp/opend.tgz -C /opt/opend && rm /tmp/opend.tgz
-COPY entrypoint.sh send.py patch_xml.py /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY fetch.py patch_xml.py /build/
+RUN python /build/fetch.py "$OPEND_URL" /out
+
+# ---- stage 2: Intel image, files only ----
+FROM ubuntu:22.04
+COPY --from=fetch /out /opt/opend
+COPY --from=fetch /etc/ssl/certs /etc/ssl/certs
+COPY --chmod=755 entrypoint.sh send.sh /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
