@@ -1322,3 +1322,91 @@ def test_broker_prefers_fresh_moomoo_price_over_stale_iex(alpaca, monkeypatch):
     assert broker.shares_outstanding("ABCD") == 12e6        # share count comes along for free
     q2 = broker.quotes(["ABCD"])["ABCD"]                     # IEX is 3 s old now: fresher, keep it
     assert q2.source == "alpaca-iex" and q2.price == 4.12
+
+
+# ---------------- v9.10: the bot's positions must follow Alpaca's ----------------
+class HoldingBroker(FakeBroker):
+    """FakeBroker that tracks real shares and refuses to sell what isn't held, like Alpaca."""
+    def __init__(self, q):
+        super().__init__(q)
+        self.held, self.sell_calls = {}, 0
+
+    def position_qty(self, s):
+        return self.held.get(s, 0.0)
+
+    def limit(self, sym, qty, side, price, extended):
+        if side == "sell":
+            self.sell_calls += 1
+            if qty > self.held.get(sym, 0) + 1e-9:
+                raise RuntimeError('{"code":40310000,"message":"account is not allowed to short"}')
+        oid = super().limit(sym, qty, side, price, extended)
+        st, f, p = self.orders[oid]
+        self.held[sym] = self.held.get(sym, 0) + (f if side == "buy" else -f)
+        return oid
+
+
+def _hold(e, b, sym="ABCD", qty=40, entry=4.0, stop=3.8):
+    from bot.smallcap.engine import Position
+    e.positions[sym] = Position(sym, qty, entry, stop, 5.0, entry, time.time() - 600, "x")
+    b.held[sym] = qty
+
+
+def test_sell_that_filled_unseen_is_cleaned_up_not_retried_forever(tmp_path):
+    """20 Nov: YMAT's sell filled but the bot missed it, then tried to sell again every 3 s all night."""
+    b = HoldingBroker(mover(price=3.5))                      # below the stop: the bot wants out
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    _hold(e, b)
+    b.held["ABCD"] = 0                                        # ...but the shares are already gone
+    run(e.manage_exits({"ABCD": b.q}, "regular"))
+    assert "ABCD" not in e.positions and b.sell_calls == 0    # checked first, never sent a doomed sell
+    assert "already closed at the broker" in open(e.cfg.journal_path).read()
+    run(e.manage_exits({"ABCD": b.q}, "regular"))             # and nothing keeps happening afterwards
+    assert b.sell_calls == 0
+
+
+def test_refused_sell_mid_exit_asks_the_broker_instead_of_crashing(tmp_path):
+    b = HoldingBroker(mover(price=3.5))
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    _hold(e, b)
+    real_limit = b.limit
+
+    def sell_fills_then_vanishes(sym, qty, side, price, extended):
+        b.held[sym] = 0                                       # the earlier order filled a split second ago
+        return real_limit(sym, qty, side, price, extended)
+    b.limit = sell_fills_then_vanishes
+    run(e.manage_exits({"ABCD": b.q}, "regular"))             # must not raise
+    assert "ABCD" not in e.positions
+
+
+def test_normal_exit_still_sells_and_records_the_price(tmp_path):
+    b = HoldingBroker(mover(price=3.5))
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    _hold(e, b)
+    run(e.manage_exits({"ABCD": b.q}, "regular"))
+    assert "ABCD" not in e.positions and b.held["ABCD"] == 0 and b.sell_calls == 1
+    text = open(e.cfg.journal_path).read()
+    assert "stop-loss" in text and "already closed" not in text
+
+
+def test_minute_check_drops_positions_alpaca_no_longer_has(tmp_path):
+    b = HoldingBroker(mover(price=4.2))                       # between stop and target: no exit reason
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    _hold(e, b, "GONE")
+    _hold(e, b, "KEEP")
+    _hold(e, b, "LESS", qty=40)
+    b.held["GONE"], b.held["LESS"] = 0, 25
+    run(e.reconcile(every=0))
+    assert "GONE" not in e.positions and "KEEP" in e.positions and e.positions["LESS"].qty == 25
+    from bot.smallcap.engine import Position
+    e.positions["NEW"] = Position("NEW", 10, 4.0, 3.8, 5.0, 4.0, time.time(), "x")     # bought just now
+    run(e.reconcile(every=0))
+    assert "NEW" in e.positions                               # broker may lag a fresh fill: leave it
+
+
+def test_unknown_broker_state_never_drops_a_position(tmp_path):
+    b = HoldingBroker(mover(price=4.2))
+    e = Engine(cfg(tmp_path), b, FakeBrain(STRONG), Sink())
+    _hold(e, b)
+    b.position_qty = lambda s: None                           # API trouble: we don't know
+    run(e.reconcile(every=0))
+    assert "ABCD" in e.positions

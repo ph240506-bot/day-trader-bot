@@ -51,13 +51,17 @@ async def worker(queue, engine, stats):
 
 
 async def exit_loop(engine, cfg, stop):
+    last_err, last_at = "", 0.0
     while not stop.is_set():
         try:
             await engine.tick()               # exits + pullback watchlist, one batched price request
             await engine.check_daily_loss()
             await engine.maybe_daily_summary()
         except Exception as e:
-            log.exception("exit loop: %s", e)
+            msg = str(e)[:200]
+            if msg != last_err or time.time() - last_at > 600:      # full detail once, then once per 10 min
+                log.exception("exit loop: %s", e)
+                last_err, last_at = msg, time.time()
         await asyncio.sleep(cfg.exit_poll_sec)
 
 

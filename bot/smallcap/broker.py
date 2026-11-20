@@ -350,6 +350,17 @@ class AlpacaBroker:
         return str(self.trading.submit_order(MarketOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)).id)
 
+    def position_qty(self, symbol):
+        """Shares Alpaca says we hold: 0.0 if none, None if we couldn't find out (never guess)."""
+        try:
+            return float(self.trading.get_open_position(symbol).qty)
+        except Exception as e:
+            msg = str(e).lower()
+            if "position does not exist" in msg or "40410000" in msg or "not found" in msg:
+                return 0.0
+            log.debug("position %s: %s", symbol, e)
+            return None
+
     @retry_once
     def order(self, order_id):
         o = self.trading.get_order_by_id(order_id)

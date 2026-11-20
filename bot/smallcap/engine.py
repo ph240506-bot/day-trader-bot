@@ -108,6 +108,7 @@ class Engine:
         self.day_stats = {"trades": 0, "wins": 0, "pnl": 0.0, "watched": 0}
         self.summary_day = None
         self.exit_failed: set[str] = set()
+        self._last_reconcile = 0.0
         os.makedirs(os.path.dirname(cfg.journal_path) or ".", exist_ok=True)
         self.state_path = os.path.join(os.path.dirname(cfg.journal_path) or ".", "smallcap_positions.json")
         self._load()
@@ -488,9 +489,27 @@ class Engine:
         return filled, avg
 
     # ---------- the per-second loop ----------
+    async def reconcile(self, every=60.0):
+        """Once a minute: any position we think we hold that Alpaca says is gone gets dropped (with a note).
+        Skips anything bought in the last 2 minutes (the broker can lag a moment behind a fresh fill)."""
+        if not self.positions or time.time() - self._last_reconcile < every:
+            return
+        self._last_reconcile = time.time()
+        for sym, p in list(self.positions.items()):
+            if sym in self.busy or time.time() - p.opened < 120:
+                continue
+            held = await self._held(sym)
+            if held is not None and held <= 1e-9:
+                self._forget(p, "found during the regular check against Alpaca")
+            elif held and held + 1e-9 < p.qty:
+                log.warning("%s: bot thought %g shares, Alpaca holds %g. Using Alpaca's number.", sym, p.qty, held)
+                p.qty = held
+                self._save()
+
     async def tick(self):
         """Called every couple of seconds: one batched price request for everything we care about."""
         self._new_day()
+        await self.reconcile()
         await self.recheck_parked()
         symbols = list(dict.fromkeys(list(self.positions) + list(self.watching)))
         if not symbols:
@@ -578,23 +597,60 @@ class Engine:
             else:
                 self._save()
 
+    async def _held(self, sym):
+        """Alpaca's share count for sym, or None if unknown (no broker support / API trouble)."""
+        fn = getattr(self.broker, "position_qty", None)
+        if fn is None:
+            return None
+        try:
+            return await self._call(fn, sym)
+        except Exception:
+            return None
+
+    def _forget(self, p, why):
+        """The broker holds none of this: drop it from our books, once, with a note (no more sell attempts)."""
+        self.positions.pop(p.symbol, None)
+        self.exit_failed.discard(p.symbol)
+        self._save()
+        log.warning("%s: Alpaca holds no shares; %s. Removed from the bot's positions.", p.symbol, why)
+        self.journal(symbol=p.symbol, source="exit", qty=p.qty, entry=p.entry, stop=p.stop, action="sold",
+                     reason=f"already closed at the broker ({why}); exit price not recorded", text=p.text)
+        self.notify.send("alert", f"{p.symbol}: already closed", f"Alpaca shows no {p.symbol} shares ({why}). "
+                         "The bot has stopped trying to sell it. Check the Alpaca app if unsure.", 3, "broom")
+
     async def _exit(self, p, q, reason, sess):
         extended = sess not in ("regular", "closing")
         ref = q.bid if q.bid > 0 else q.price
-        remaining, sold, value = p.qty, 0.0, 0.0
-        for attempt in range(3):                       # marketable limit, a bit lower each try
-            if remaining <= 0:
-                break
-            limit = round_price(ref * (1 - self.cfg.exit_slippage_pct * (attempt + 1) / 100))
-            oid = await self._call(self.broker.limit, p.symbol, remaining, "sell", limit, extended)
-            f, a = await self._await_fill(oid, 5)
-            if f > 0:
-                sold, value, remaining = sold + f, value + f * a, remaining - f
-        if remaining > 0 and not extended:             # regular hours: last resort market order
-            oid = await self._call(self.broker.market_sell, p.symbol, remaining)
-            f, a = await self._await_fill(oid, 10)
-            if f > 0:
-                sold, value, remaining = sold + f, value + f * a, remaining - f
+        held = await self._held(p.symbol)
+        if held is not None and held <= 1e-9:
+            self._forget(p, "an earlier sell filled after the bot stopped watching it")
+            return
+        remaining, sold, value = (min(p.qty, held) if held else p.qty), 0.0, 0.0
+        try:
+            for attempt in range(3):                       # marketable limit, a bit lower each try
+                if remaining <= 0:
+                    break
+                limit = round_price(ref * (1 - self.cfg.exit_slippage_pct * (attempt + 1) / 100))
+                oid = await self._call(self.broker.limit, p.symbol, remaining, "sell", limit, extended)
+                f, a = await self._await_fill(oid, 5)
+                if f > 0:
+                    sold, value, remaining = sold + f, value + f * a, remaining - f
+            if remaining > 0 and not extended:             # regular hours: last resort market order
+                oid = await self._call(self.broker.market_sell, p.symbol, remaining)
+                f, a = await self._await_fill(oid, 10)
+                if f > 0:
+                    sold, value, remaining = sold + f, value + f * a, remaining - f
+        except Exception as e:
+            # A refused sell ("not allowed to short", "insufficient qty") usually means a fill we didn't see.
+            # Ask the broker what's really held instead of retrying the same order forever.
+            held = await self._held(p.symbol)
+            if held is None:
+                raise
+            log.warning("%s: sell refused (%s); Alpaca holds %g", p.symbol, str(e)[:100], held)
+            if held <= 1e-9 and sold <= 0:
+                self._forget(p, "a sell filled that the bot didn't see")
+                return
+            remaining = held
         if sold <= 0:
             if p.symbol not in self.exit_failed:
                 self.exit_failed.add(p.symbol)
