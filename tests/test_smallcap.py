@@ -1438,3 +1438,21 @@ def test_report_shows_how_far_stops_slipped():
             {"action": "sold", "reason": "trailing stop", "entry": "2.04", "stop": "2.10", "exit": "2.09"}]
     line = stop_lines(rows)[0]
     assert "Stop-outs: 2" in line and "planned loss 3.0%" in line and "actual 5.0%" in line and "1.7x planned" in line
+
+
+# ---------------- report: news vs momentum ----------------
+def test_report_splits_news_and_momentum_trades():
+    from bot.report import split_lines
+    trades = [{"symbol": "CNSY", "pnl": 3.01, "opened": "2026-11-13T15:21:02.1Z"},
+              {"symbol": "MSS", "pnl": -4.02, "opened": "2026-11-20T15:29:00Z"},
+              {"symbol": "TREO", "pnl": -4.76, "opened": "2026-11-16T14:41:00Z"},
+              {"symbol": "OLD", "pnl": 1.00, "opened": "2026-11-01T14:41:00Z"}]
+    journal = [{"time": "2026-11-13T15:21:05+00:00", "symbol": "CNSY", "action": "bought", "rule": "momentum"},
+               {"time": "2026-11-20T15:29:03+00:00", "symbol": "MSS", "action": "bought", "rule": "momentum"},
+               {"time": "2026-11-16T14:41:04+00:00", "symbol": "TREO", "action": "bought", "rule": "strong"},
+               {"time": "2026-11-16T14:41:04+00:00", "symbol": "TREO", "action": "sold", "rule": ""},
+               {"time": "2026-11-02T14:41:04+00:00", "symbol": "OLD", "action": "bought", "rule": "strong"}]
+    text = "\n".join(split_lines(trades, journal))
+    assert "News trades: 1 trades, 0 wins (0%), total -$4.76" in text
+    assert "Momentum trades (no news): 2 trades, 1 wins (50%), total -$1.01" in text
+    assert "Unlabelled: 1 trades" in text            # OLD's buy row is a day off: not matched, not guessed

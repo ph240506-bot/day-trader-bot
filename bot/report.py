@@ -89,6 +89,50 @@ def summarize(trades: list[dict]) -> list[str]:
     return lines
 
 
+def _ts(s):
+    try:
+        t = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def label_trades(trades: list[dict], journal_rows: list[dict], within_min: float = 30) -> list[dict]:
+    """Tag each small-cap trade 'news' or 'momentum' from the journal's 'bought' row nearest in time
+    (same stock, within 30 min of the buy fill). No matching row = 'unknown'."""
+    buys = {}
+    for r in journal_rows:
+        if r.get("action") == "bought" and _ts(r.get("time")):
+            buys.setdefault(r.get("symbol", ""), []).append((_ts(r["time"]), r.get("rule", "")))
+    out = []
+    for t in trades:
+        opened, kind = _ts(t.get("opened")), "unknown"
+        cands = [(abs((bt - opened).total_seconds()), rule) for bt, rule in buys.get(t["symbol"], [])] if opened else []
+        if cands:
+            gap, rule = min(cands)
+            if gap <= within_min * 60:
+                kind = "momentum" if rule == "momentum" else "news"
+        out.append({**t, "kind": kind})
+    return out
+
+
+def split_lines(trades: list[dict], journal_rows: list[dict]) -> list[str]:
+    """News-driven trades vs momentum (no-news) trades, side by side."""
+    labelled = label_trades(trades, journal_rows)
+    lines = []
+    for kind, title in (("news", "News trades"), ("momentum", "Momentum trades (no news)"), ("unknown", "Unlabelled")):
+        group = [t for t in labelled if t["kind"] == kind]
+        if not group:
+            if kind != "unknown":
+                lines.append(f"  {title}: none")
+            continue
+        wins = sum(1 for t in group if t["pnl"] > 0)
+        total = sum(t["pnl"] for t in group)
+        lines.append(f"  {title}: {len(group)} trades, {wins} wins ({wins / len(group) * 100:.0f}%), "
+                     f"total {money(total)}, avg {money(total / len(group))} a trade")
+    return lines
+
+
 def order_lines(orders, n_fills) -> list[str]:
     """What actually happened to each order: filled, cancelled, rejected..."""
     if not orders:
@@ -208,7 +252,11 @@ def account_block(title, key, secret, paper, days, journal, kind) -> list[str]:
         eq, last = float(acct.equity), float(acct.last_equity)
         lines.append(f"  Account: ${eq:,.2f} (today {eq - last:+,.2f})   Open positions: "
                      + (", ".join(f"{p.symbol} {float(p.unrealized_pl):+.2f}" for p in positions) or "none"))
-        lines += summarize(round_trips(fills))
+        trades = round_trips(fills)
+        lines += summarize(trades)
+        if kind == "smallcap" and trades:
+            lines += split_lines(trades, read_csv(journal, (datetime.now(timezone.utc) - timedelta(days=days + 1))
+                                                  .isoformat(timespec="seconds")))
         lines += order_lines(orders, len(fills))
     except Exception as e:
         lines.append(f"  Couldn't reach Alpaca: {e}")
