@@ -49,6 +49,11 @@ class SCConfig:
     require_above_vwap: bool = field(default_factory=lambda: _e("SC_REQUIRE_ABOVE_VWAP", True, bool))
     stop_buffer_pct: float = field(default_factory=lambda: _e("SC_STOP_BUFFER_PCT", 1.0, float))
     max_stop_pct: float = field(default_factory=lambda: _e("SC_MAX_STOP_PCT", 10.0, float))
+    # Never put the stop inside the noise: at least this % and this many cents below the entry. A $1 stock moves
+    # in 1-cent (1%) steps, so a 2-3 cent stop gets hit by the spread alone and the exit fills below it. The
+    # position is sized from the wider stop, so the dollars at risk stay the same: just fewer shares.
+    min_stop_pct: float = field(default_factory=lambda: _e("SC_MIN_STOP_PCT", 4.0, float))
+    min_stop_cents: float = field(default_factory=lambda: _e("SC_MIN_STOP_CENTS", 4.0, float))
     reward_risk: float = field(default_factory=lambda: _e("SC_REWARD_RISK", 2.0, float))
     risk_per_trade_pct: float = field(default_factory=lambda: _e("SC_RISK_PER_TRADE_PCT", 1.0, float))
     max_quote_age_sec: float = field(default_factory=lambda: _e("SC_MAX_QUOTE_AGE_SEC", 180.0, float))

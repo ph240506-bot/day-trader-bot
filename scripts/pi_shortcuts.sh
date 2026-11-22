@@ -24,6 +24,16 @@ moomoopic()  { cd $BOTDIR && docker compose exec -T opend /usr/local/bin/send.sh
 moomootest() { cd $BOTDIR && docker compose exec -T -e SC_MOOMOO=true smallcap python -m bot.smallcap.moomoo_test "$@"; }
 moomooon()  { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=true" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices ON"; }
 moomoooff() { cd $BOTDIR && sed -i '/^SC_MOOMOO=/d' .env && echo "SC_MOOMOO=false" >> .env && docker compose up -d --force-recreate smallcap && echo "moomoo prices OFF"; }
+# --- research ---
+botstudy() {
+  cd $BOTDIR && rm -f journal/study_report.txt
+  docker compose exec -d -e DAYS="${DAYS:-120}" bot sh -c 'python -m bot.study > journal/study_progress.txt 2>&1' \
+    && echo "Early-mover study started in the background (about 20-40 min). Check on it with: botstudyresult"
+}
+botstudyresult() {
+  if [ -f $BOTDIR/journal/study_report.txt ]; then cat $BOTDIR/journal/study_report.txt
+  else echo "Still running. Latest progress:"; tail -4 $BOTDIR/journal/study_progress.txt 2>/dev/null; fi
+}
 alias botexport='cd $BOTDIR && docker compose exec -T bot python - < scripts/export_fills.py'
 
 # --- safety ---
@@ -55,6 +65,7 @@ bottemp     live temperature (Ctrl+C to stop)
 botrestart  restart main bot         screstart  restart small-cap bot
 botupdate   install an update (after pushing from your Mac)
 botreport   performance report (DAYS=30 botreport for a month) - paste it to Claude
+  botstudy / botstudyresult   test chart markers for catching small-cap movers early (runs in background)
   moomoolog / moomoocode 123456 / moomootest / moomooon / moomoooff   moomoo live prices
   botbacktest compare ORB vs EMA on 90 days of real data, net of costs (~10 min; DAYS=180 botbacktest)
 botexport   export all fills from Alpaca (for the monthly review)

@@ -121,6 +121,25 @@ def filter_kind(reason: str) -> str:
     return re.sub(r"\s*\(need N%\)|\s*\(max NM\)", "", r).strip()[:44]
 
 
+def stop_lines(rows) -> list[str]:
+    """Stop-outs: how far below the stop did the exit actually fill? (planned loss vs real loss)"""
+    planned, actual = [], []
+    for r in rows:
+        if r.get("action") not in ("sold", "partial-sell") or "stop-loss" not in (r.get("reason") or ""):
+            continue
+        try:
+            entry, stop, exit_ = float(r["entry"]), float(r["stop"]), float(r["exit"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if entry > stop > 0:
+            planned.append((entry - stop) / entry * 100)
+            actual.append((entry - exit_) / entry * 100)
+    if not planned:
+        return []
+    p, a = sum(planned) / len(planned), sum(actual) / len(actual)
+    return [f"  Stop-outs: {len(planned)}, planned loss {p:.1f}% avg, actual {a:.1f}% avg ({a / p:.1f}x planned)"]
+
+
 def journal_lines(path, since, kind) -> list[str]:
     rows = read_csv(path, since)
     if not rows:
@@ -142,6 +161,7 @@ def journal_lines(path, since, kind) -> list[str]:
         reasons = Counter(filter_kind(r.get("reason") or "") for r in rows if r.get("action") == "filtered")
         if reasons:
             lines.append("  Top filter reasons: " + "; ".join(f"{k} ({v})" for k, v in reasons.most_common(6)))
+        lines += stop_lines(rows)
         lat = [int(r["latency_ms"]) for r in rows if (r.get("latency_ms") or "").isdigit()]
         if lat:
             lat.sort()

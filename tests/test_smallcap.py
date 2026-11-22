@@ -261,6 +261,7 @@ def tick_prices(e, b, prices, age=1.0):
 
 def test_pullback_buy_with_stop_under_the_low(tmp_path):
     e, b, sink = _watching(tmp_path, vwap=3.90)
+    e.cfg.min_stop_pct = e.cfg.min_stop_cents = 0          # this test is about the dip-low rule on its own
     tick_prices(e, b, [4.40, 4.20, 4.10, 4.12])
     assert not b.placed and e.watching["ABCD"].low == 4.10
     tick_prices(e, b, [4.17])                     # +1.7% off the low, above VWAP -> buy
@@ -1410,3 +1411,30 @@ def test_unknown_broker_state_never_drops_a_position(tmp_path):
     b.position_qty = lambda s: None                           # API trouble: we don't know
     run(e.reconcile(every=0))
     assert "ABCD" in e.positions
+
+
+# ---------------- v9.11: stops outside the noise; report shows stop slippage ----------------
+def test_pullback_stop_is_never_inside_the_noise(tmp_path):
+    """21 Nov: MSS at $1.00 had its stop 3 cents below; the exit filled 6 cents below. Stop now >= 4% / 4 cents."""
+    from bot.smallcap.engine import Watch
+    b = FakeBroker(mover(price=1.00, prev=0.66, bid=0.99, ask=1.00))
+    e = Engine(cfg(tmp_path, entry_mode="pullback", require_above_vwap=False), b, FakeBrain(STRONG), Sink())
+    w = Watch("ABCD", time.time(), 1.03, reason="x", text="x", base={"symbol": "ABCD"})
+    w.state, w.low = "pulling", 0.98
+    e.watching["ABCD"] = w
+    b.q = mover(price=1.00, prev=0.66, bid=0.99, ask=1.00)
+    run(e.manage_watch({"ABCD": b.q}, "regular"))
+    p = e.positions["ABCD"]
+    assert p.stop <= 0.96                                     # old rule: 0.97 (1% under the 0.98 low)
+    # same dollars at risk: fewer shares than a 3-cent stop would have bought
+    assert b.placed[0][1] <= int(1000 * 0.01 / (b.placed[0][3] - 0.96)) + 1
+
+
+def test_report_shows_how_far_stops_slipped():
+    from bot.report import stop_lines
+    rows = [{"action": "sold", "reason": "stop-loss", "entry": "1.00", "stop": "0.97", "exit": "0.94"},
+            {"action": "sold", "reason": "stop-loss", "entry": "2.04", "stop": "1.98", "exit": "1.96"},
+            {"action": "sold", "reason": "target", "entry": "1.00", "stop": "0.97", "exit": "1.05"},
+            {"action": "sold", "reason": "trailing stop", "entry": "2.04", "stop": "2.10", "exit": "2.09"}]
+    line = stop_lines(rows)[0]
+    assert "Stop-outs: 2" in line and "planned loss 3.0%" in line and "actual 5.0%" in line and "1.7x planned" in line

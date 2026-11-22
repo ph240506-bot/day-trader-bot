@@ -550,7 +550,9 @@ class Engine:
                     w.vwap, w.vwap_at = (await self._call(self.broker.intraday, sym))[0], time.time()
                 if w.vwap is not None and q.price < w.vwap:
                     continue                 # bounced, but still below the day's average price: wait
-            stop = round_price(w.low * (1 - cfg.stop_buffer_pct / 100))
+            stop = round_price(min(w.low * (1 - cfg.stop_buffer_pct / 100),
+                                   q.price * (1 - cfg.min_stop_pct / 100),
+                                   q.price - cfg.min_stop_cents / 100))
             if (q.price - stop) / q.price * 100 > cfg.max_stop_pct:
                 self.watching.pop(sym)
                 self.journal(**w.base, action="watch-failed", reason="stop would be too far below")
