@@ -30,6 +30,7 @@ botstudy() {
   docker compose exec -d -e DAYS="${DAYS:-120}" bot sh -c 'python -m bot.study > journal/study_progress.txt 2>&1' \
     && echo "Early-mover study started in the background (about 20-40 min). Check on it with: botstudyresult"
 }
+botcombo() { cd $BOTDIR && docker compose exec -T bot python -m bot.combo; }
 botstudyresult() {
   if [ -f $BOTDIR/journal/study_report.txt ]; then cat $BOTDIR/journal/study_report.txt
   else echo "Still running. Latest progress:"; tail -4 $BOTDIR/journal/study_progress.txt 2>/dev/null; fi
@@ -65,6 +66,7 @@ bottemp     live temperature (Ctrl+C to stop)
 botrestart  restart main bot         screstart  restart small-cap bot
 botupdate   install an update (after pushing from your Mac)
 botreport   performance report (DAYS=30 botreport for a month) - paste it to Claude
+  botcombo    test combinations of the study's markers (choose on first half, judge on second)
   botstudy / botstudyresult   test chart markers for catching small-cap movers early (runs in background)
   moomoolog / moomoocode 123456 / moomootest / moomooon / moomoooff   moomoo live prices
   botbacktest compare ORB vs EMA on 90 days of real data, net of costs (~10 min; DAYS=180 botbacktest)
