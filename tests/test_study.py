@@ -96,3 +96,108 @@ def test_summary_weights_the_sampled_non_movers():
     assert "fires ~ 10.0/day" in line                         # 1 mover + 1 sampled standing for 9 others
     assert "10.0% were real movers" in line and "caught 50.0% of movers early" in line
     assert "avg -0.40%" in line                               # (5*1 - 1*9) / 10
+
+
+# ---------------- trader setups ----------------
+def setup_day(reg_prices, open_first=None, pm=None, trades=None):
+    """Regular-session bars only matter here; pre-market is flat at the first price unless given."""
+    pm = pm if pm is not None else [reg_prices[0]] * PM
+    df = day(pm + reg_prices)
+    if open_first is not None:
+        df.iloc[PM, df.columns.get_loc("open")] = open_first
+    if trades is not None:
+        df["trade_count"] = np.array(trades, float)
+    return df
+
+
+def test_red_to_green():
+    reg = [1.95] * 10 + [2.02] * (REG - 10)                    # opened red at 1.95, crosses 2.00 at 9:40
+    out = detect_markers(setup_day(reg, open_first=1.95), 2.0, 500_000)
+    assert out["red_to_green"] == PM + 10
+    assert "red_to_green" not in detect_markers(setup_day([2.05] * REG, open_first=2.05), 2.0, 500_000)  # opened green
+
+
+def test_one_min_orb_needs_a_gap():
+    reg = [2.20] + [2.19] * 9 + [2.30] * (REG - 10)
+    df = setup_day(reg, open_first=2.15)                        # gapped +7.5%
+    assert detect_markers(df, 2.0, 500_000)["one_min_orb"] == PM + 10
+    reg2 = [2.02] + [2.01] * 9 + [2.10] * (REG - 10)
+    assert "one_min_orb" not in detect_markers(setup_day(reg2, open_first=2.01), 2.0, 500_000)   # no gap
+
+
+def test_bull_flag_and_micro_pullback():
+    pole = [2.30, 2.36, 2.42, 2.48]                             # 3 green bars up from 2.30
+    flag = [2.46, 2.44]                                         # 2 red bars, shallow
+    reg = [2.30] * 10 + pole[1:] + flag + [2.52] + [2.52] * (REG - 16)
+    df = setup_day(reg)
+    df.iloc[PM + 10, df.columns.get_loc("open")] = 2.28         # make the first pole bar green
+    out = detect_markers(df, 2.0, 500_000)
+    assert out["bull_flag"] == PM + 15                          # breaks the flag high at the green bar
+    assert out["micro_pullback"] == PM + 15
+
+
+def test_bull_flag_rejects_deep_pullbacks():
+    reg = [2.30] * 10 + [2.36, 2.42, 2.48] + [2.40, 2.32] + [2.52] + [2.52] * (REG - 16)   # gave back ~90%
+    df = setup_day(reg)
+    df.iloc[PM + 10, df.columns.get_loc("open")] = 2.28
+    assert "bull_flag" not in detect_markers(df, 2.0, 500_000)
+
+
+def test_flat_top_hod_and_whole_dollar():
+    reg = [2.30] * 10 + [2.40, 2.35, 2.40, 2.36, 2.40, 2.37, 2.38, 2.39, 2.38, 2.39] + [2.45] + [2.45] * (REG - 21)
+    vols = [10] * PM + [100] * REG
+    vols[PM + 20] = 400
+    df = day([2.30] * PM + reg, vols)
+    out = detect_markers(df, 2.0, 500_000)
+    assert out["flat_top_breakout"] == PM + 20
+    hod = [2.30] * 5 + [2.40] + [2.35] * 20 + [2.45] + [2.45] * (REG - 27)      # new high 21 min after the last
+    assert detect_markers(setup_day(hod), 2.0, 500_000)["hod_break"] == PM + 26
+    wd = [2.40] * 10 + [2.45, 2.52] + [2.52] * (REG - 12)                       # crosses $2.50
+    assert detect_markers(setup_day(wd), 2.0, 500_000)["whole_dollar_break"] == PM + 11
+
+
+def test_print_surge_needs_trade_counts():
+    reg = [2.04] * REG
+    trades = [1] * PM + [20] * REG
+    trades[PM + 30:PM + 35] = [3000] * 5                        # 7,800 trades a day = 100 per 5 min normally
+    out = detect_markers(setup_day(reg, trades=trades), 2.0, 500_000, {"avg_daily_trades": 7_800})
+    assert out["print_surge"] == PM + 30
+    assert "print_surge" not in detect_markers(setup_day(reg), 2.0, 500_000, {"avg_daily_trades": 7_800})
+
+
+def test_day2_and_first_green_day_use_yesterday():
+    reg = [2.50] * 20 + [2.70] + [2.70] * (REG - 21)
+    ctx = {"prev_gain": 0.45, "prev_high": 2.60}
+    assert detect_markers(setup_day(reg), 2.0, 500_000, ctx)["day2_continuation"] == PM + 20
+    assert "day2_continuation" not in detect_markers(setup_day(reg), 2.0, 500_000, {"prev_gain": 0.1, "prev_high": 2.6})
+    fg = [1.98] * 15 + [2.07] + [2.07] * (REG - 16)
+    ctx = {"red_days": 4, "drop": 0.25}
+    assert detect_markers(setup_day(fg), 2.0, 500_000, ctx)["first_green_day"] == PM + 15
+    assert "first_green_day" not in detect_markers(setup_day(fg), 2.0, 500_000, {"red_days": 1, "drop": 0.25})
+
+
+def test_no_marker_ever_peeks_ahead():
+    """All 14: cut the day right after a signal, and the same signal must still fire at the same minute."""
+    rng = np.random.default_rng(11)
+    ctx = {"avg_daily_trades": 40_000, "prev_gain": 0.5, "prev_high": 2.05, "red_days": 4, "drop": 0.3}
+    fired = set()
+    for seed in range(40):
+        p = 2.0 * np.exp(np.cumsum(rng.normal(0.0006, 0.006, PM + REG)))
+        df = day(p, rng.lognormal(5, 1.2, PM + REG))
+        df["trade_count"] = rng.lognormal(3, 1.5, PM + REG)
+        full = detect_markers(df, 2.0, 50_000, ctx)
+        for mk, i in full.items():
+            fired.add(mk)
+            assert detect_markers(df.iloc[:i + 1], 2.0, 50_000, ctx).get(mk) == i, (seed, mk)
+    assert len(fired) >= 10                                     # the check really exercised most markers
+
+
+def test_edge_check_flags_luck_and_unstable_results():
+    from bot.study import edge_check
+    days = pd.date_range("2026-01-01", periods=100).date
+    steady = pd.DataFrame({"day": np.repeat(days, 10), "weight": 1.0,
+                           "net_pct": np.random.default_rng(1).normal(0.8, 2.0, 1000)})
+    mean, t, h1, h2 = edge_check(steady, days[49])
+    assert t > 5 and h1 > 0 and h2 > 0
+    noise = steady.assign(net_pct=np.random.default_rng(2).normal(0.0, 2.0, 1000))
+    assert abs(edge_check(noise, days[49])[1]) < 3
